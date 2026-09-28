@@ -1,0 +1,6 @@
+# Lint config. luau-lsp does the precise Roblox API type checking (tools/check.sh);
+# selene uses a minimal Roblox std (roblox_min.yml) so it also works offline.
+std = "roblox_min"
+
+[lints]
+shadowing = "allow"

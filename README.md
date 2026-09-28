@@ -1,61 +1,94 @@
-# ⚔️ Roblox AI Skills for Antigravity & Luau
+# ⚔️ Roblox AI Skills — Combat VFX & R6 Procedural Animation
 
-High-performance, production-ready AI skills designed for building fast-paced action RPGs (such as *Deepwoken*, *Jujutsu Shenanigans*, and *Type Soul*) on Roblox with Luau.
+Production-grade AI skills for fast-paced Roblox action games (*Deepwoken*, *Jujutsu
+Shenanigans*, *Type Soul* style), for **Claude Code** and **Google Antigravity**.
 
-These skills teach AI coding assistants (like Google Antigravity / Gemini) to avoid default low-quality particles and rigid animations, enforcing modern studio standards: **3D Mesh VFX**, **UV Texture Panning**, **Procedural R6 Movement**, and **Terrain Adaptation**.
+Each skill is two things at once:
 
----
+1. **A playbook** (`SKILL.md` + `references/`) that teaches the agent the right architecture,
+   the math, the engine limits and the verified pitfalls;
+2. **A drop-in, tested Luau library** (`src/`, a Rojo project) the agent builds on, with a
+   playable demo.
 
-## 📦 Included Skills
-
-### 1. [`roblox-mesh-vfx`](./skills/roblox-mesh-vfx/)
-High-end visual effects pipeline using custom 3D meshes (Blender ➔ Roblox) instead of primitive particles.
-* **100% Client-Side Rendering**: Server only transmits network metadata via `UnreliableRemoteEvent`.
-* **Mesh Animation & Math**: Non-uniform scaling (*Squash & Stretch*) with `TweenService` and `ExponentialOut` easing.
-* **Terrain Normal Raycast Alignment**: Aligns ground shockwaves, craters, and dust to the exact slope of the terrain.
-* **UV Scrolling / Texture Panning**: Real-time offsets on `RenderStepped` for energy blades, magical auras, and fluid motion.
-* **Hitstop & Impact Weight**: Frame freezing on attacker and victim (0.05s - 0.10s) + Bloom/ColorCorrection micro-flashes.
-
-### 2. [`roblox-r6-procedural-animation`](./skills/roblox-r6-procedural-animation/)
-Dynamic terrain adaptation and procedural movement tailored specifically for **R6 character rigs**.
-* **Dual-Leg Raycasting**: Continuous ground detection under left and right hips.
-* **Pelvis Drop (Anti-Stretching)**: Automatically lowers `RootJoint.C0` when stepping on stairs or rocks so legs never float or distort.
-* **Ground Normal Foot Tilting**: Rotates `Left Hip.C0` and `Right Hip.C0` to match slopes.
-* **Procedural Body Leaning**: Tilts the torso forward/backward based on velocity and banking into sharp turns.
-* **Head & Neck Tracking**: Smooth `Neck.C0` orientation following the camera with safe angle clamping.
+Everything is `--!strict`, type-checked against the Roblox API definitions, linted, formatted
+and unit-tested in CI (48 tests, including forward-kinematics proofs on a simulated R6 rig).
 
 ---
 
-## 🚀 How to Install & Use
+## 📦 Skills
 
-### Option A: As Workspace Skills (Project-Specific)
-Clone this repository into your project root. The skills are located in `.agents/skills/` and will be automatically recognized by Antigravity:
+### 1. [`roblox-mesh-vfx`](./.claude/skills/roblox-mesh-vfx/)
+Client-rendered combat VFX with server authority.
+
+- **Effects**: `Slash` (mesh or beam crescent), `Shockwave` (ground-aligned rings), `CraterRocks`
+  (rocks + debris that take the color/material of the ground), `ImpactBurst` (sparks, flash,
+  victim highlight), `GroundSlam` (combo) — all work with **zero assets** and upgrade to your
+  Blender meshes automatically.
+- **Game feel**: `Hitstop` (freezes every track, restores original speeds, stacks),
+  `CameraShaker` (trauma² Perlin shake, directional kick, FOV punch, no drift),
+  `ScreenFlash` (bloom/contrast/blur punches, manga impact frames), reduced-motion aware.
+- **Engine**: one shared `Animator` loop (time-scale groups, batched `BulkMoveTo`, error
+  isolation), `Pool`, `Fade` (fades decals/beams/particles too), `BeamArc`, `Particles`,
+  `TextureAnimator` (UV scroll, flipbooks, spritesheets), analytic `Spring`.
+- **Network**: 31-byte binary records batched per frame over `UnreliableRemoteEvent`,
+  interest radius, seeded determinism, client prediction with `exclude`.
+
+### 2. [`roblox-r6-procedural-animation`](./.claude/skills/roblox-r6-procedural-animation/)
+Layered procedural motion for every visible R6 character (players and NPCs).
+
+- **Layers**: `BodyLean` (speed + acceleration lean, physical turn banking, slope lean),
+  `TerrainAdaptation` (pelvis drop + leg tuck/bend foot planting on stairs/rocks/slopes),
+  `LandingImpact`, `HeadLook` (camera tracking, torso share, gaze stabilization, arm aim),
+  `Breathing`.
+- **Correct by construction**: offsets are written in Part0 space and layered on
+  `Transform` in `PreSimulation` (works with Motor6D and AnimationConstraint, stacks with
+  animations, never accumulates).
+- **Multiplayer**: every client animates everyone locally; only head-look angles are
+  replicated (4 bytes up, batched 12 bytes/player down, validated and rate-limited).
+- **Scalable**: distance/on-screen LOD, attribute-based gameplay control (`R6_HeadLook = 0`...).
+
+---
+
+## 🚀 Install
+
+### Claude Code (this repo)
+Skills in `.claude/skills/` load automatically in Claude Code sessions opened on this
+repository (local or cloud). To use them in another project, copy the folders into that
+project's `.claude/skills/` (or `~/.claude/skills/` for all projects).
+
+### Antigravity
+- Workspace skills: `.agents/skills/` (mirrored copy).
+- Global skills: copy `skills/*` into your Antigravity/Gemini global skills folder.
+
+`.claude/skills` is the source of truth; `tools/sync-skills.sh` regenerates both copies and
+CI fails if they drift.
+
+### Use the Luau code in a game
+Each skill folder is a Rojo project:
 ```bash
-git clone https://github.com/Willikk/Roblox.git
+cd .claude/skills/roblox-mesh-vfx && rojo serve default.project.json
 ```
-
-### Option B: As Global Skills (Available in All Projects)
-Copy the skills folders to your machine's global configuration directory:
-
-**Windows (PowerShell):**
-```powershell
-Copy-Item -Path ".\skills\*" -Destination "$HOME\.gemini\config\skills\" -Recurse -Force
-```
-
-**macOS / Linux:**
-```bash
-cp -r ./skills/* ~/.gemini/config/skills/
-```
+or copy `src/shared/*` → ReplicatedStorage, `src/server` → ServerScriptService,
+`src/client` → StarterPlayerScripts (see each `SKILL.md` Quick start). The R6 skill needs
+Game Settings → Avatar → R6.
 
 ---
 
-## 🛠️ Tech Stack & Requirements
-* **Language**: Luau (with `--!strict` typing)
-* **Target Engine**: Roblox Studio
-* **Rig Type**: R6 (Procedural Animation) & R6/R15 (Mesh VFX)
-* **Compatible Tools**: [Rojo](https://rojo.space/), [StyLua](https://github.com/JohnnyMorganz/StyLua), [Selene](https://github.com/Kampfkarren/selene)
+## 🧪 Quality gates
+
+```bash
+tools/install-tools.sh   # pinned lune, stylua, selene, luau-lsp, rojo (or: rokit install)
+tools/check.sh           # format + lint + strict type check + tests + copy sync
+```
+
+| Gate | Tool |
+|---|---|
+| Formatting | StyLua (`stylua.toml`) |
+| Lint | Selene (`selene.toml`, offline Roblox std `roblox_min.yml`) |
+| Types | luau-lsp `analyze`, Roblox definitions + Rojo sourcemaps, `--!strict` |
+| Tests | Lune (`tools/test/`), real module sources in a mocked Roblox sandbox |
 
 ---
 
 ## 📄 License
-MIT License. Free to use and modify for personal and commercial Roblox games.
+MIT. Free to use and modify for personal and commercial Roblox games.

@@ -1,0 +1,20 @@
+{
+  "name": "roblox-mesh-vfx",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "VFX": { "$path": "src/shared/VFX" },
+      "VFXDemo": { "$path": "src/demo/shared" }
+    },
+    "ServerScriptService": {
+      "VFXServer": { "$path": "src/server" },
+      "VFXDemoServer": { "$path": "src/demo/server/DemoServer.server.luau" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "VFXClient": { "$path": "src/client" },
+        "VFXDemoClient": { "$path": "src/demo/client/DemoClient.client.luau" }
+      }
+    }
+  }
+}
