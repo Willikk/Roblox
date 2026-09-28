@@ -11,7 +11,7 @@ Each skill is two things at once:
    playable demo.
 
 Everything is `--!strict`, type-checked against the Roblox API definitions, linted, formatted
-and unit-tested in CI (48 tests, including forward-kinematics proofs on a simulated R6 rig).
+and unit-tested in CI (63 tests, including forward-kinematics proofs on a simulated R6 rig).
 
 ---
 
@@ -46,6 +46,18 @@ Layered procedural motion for every visible R6 character (players and NPCs).
 - **Multiplayer**: every client animates everyone locally; only head-look angles are
   replicated (4 bytes up, batched 12 bytes/player down, validated and rate-limited).
 - **Scalable**: distance/on-screen LOD, attribute-based gameplay control (`R6_HeadLook = 0`...).
+
+---
+
+### 3. [`roblox-deepwoken-combat`](./.claude/skills/roblox-deepwoken-combat/)
+Server-authoritative sword & fists melee (Deepwoken / Sekiro model).
+
+- 4-hit M1 chains with finishers, criticals, **perilous** red-flash attacks, feints,
+  **parry** (tap F) / **block** (hold F), posture bar and **guard breaks**, dodges with
+  i-frames and roll cancel, hitstun, knockback, hyper armor.
+- Lag-compensated hitboxes (position history + capped rewind), client prediction.
+- Procedural attack animations generated from move timings (zero animation assets).
+- Playable arena with Guard / Parry / Fighter training NPCs.
 
 ---
 

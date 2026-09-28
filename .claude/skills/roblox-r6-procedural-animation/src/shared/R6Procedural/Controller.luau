@@ -42,6 +42,7 @@ Controller.layers = {
 	require(R6Procedural.Layers.LandingImpact),
 	require(R6Procedural.Layers.HeadLook),
 	require(R6Procedural.Layers.Breathing),
+	require(R6Procedural.Layers.ActionPose), -- combat poses, applied on top of everything
 } :: { Types.Layer }
 
 type Entry = {
@@ -263,6 +264,11 @@ local function onPreSimulation(dt: number)
 			continue
 		end
 		local interval = if model:GetAttribute("R6_Disabled") == true then nil else lodInterval(entry, camera)
+		-- Attacks last a few frames: never throttle a character that is performing an action.
+		local action = model:GetAttribute("R6_Action")
+		if interval and type(action) == "string" and action ~= "" then
+			interval = 0
+		end
 		if interval == nil then
 			if entry.enabled then
 				rig:restore()

@@ -13,6 +13,11 @@ local NAMES: { string } = {
 	"CraterRocks",
 	"ImpactBurst",
 	"GroundSlam",
+	"Parry",
+	"Block",
+	"GuardBreak",
+	"FistImpact",
+	"Telegraph",
 }
 
 local Registry = {}

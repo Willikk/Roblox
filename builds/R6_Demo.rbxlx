@@ -168,6 +168,7 @@ Controller.layers = {
 	require(R6Procedural.Layers.LandingImpact),
 	require(R6Procedural.Layers.HeadLook),
 	require(R6Procedural.Layers.Breathing),
+	require(R6Procedural.Layers.ActionPose), -- combat poses, applied on top of everything
 } :: { Types.Layer }
 
 type Entry = {
@@ -389,6 +390,11 @@ local function onPreSimulation(dt: number)
 			continue
 		end
 		local interval = if model:GetAttribute("R6_Disabled") == true then nil else lodInterval(entry, camera)
+		-- Attacks last a few frames: never throttle a character that is performing an action.
+		local action = model:GetAttribute("R6_Action")
+		if interval and type(action) == "string" and action ~= "" then
+			interval = 0
+		end
 		if interval == nil then
 			if entry.enabled then
 				rig:restore()
@@ -495,6 +501,117 @@ return Controller
         </Properties>
         <Item class="ModuleScript" referent="5">
           <Properties>
+            <string name="Name">ActionPose</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ActionPose
+	Plays PoseLibrary clips (attacks, blocks, parries, reactions) on top of every other
+	layer, synchronized across clients.
+
+	Replication: the server sets two attributes on the character Model
+	  R6_Action      = clip name ("" / nil = none)
+	  R6_ActionStart = workspace:GetServerTimeNow() when it started
+	  R6_ActionSpeed = playback speed (optional, default 1)
+	Every client samples the clip at (GetServerTimeNow() - start) * speed, so all screens
+	show the same frame. The local player can predict with ActionPose.playLocal(), which
+	wins over the replicated value for the same clip until it ends.
+]]
+
+local R6Procedural = script.Parent.Parent
+local PoseLibrary = require(R6Procedural.PoseLibrary)
+local Rig = require(R6Procedural.Rig)
+local Types = require(R6Procedural.Types)
+
+type Override = { clip: string, start: number, speed: number }
+
+local ActionPose = { name = "ActionPose" } :: Types.Layer & {
+	playLocal: (model: Model, clip: string, speed: number?) -> (),
+	stopLocal: (model: Model) -> (),
+	now: () -> number,
+}
+
+local overrides: { [Model]: Override } = setmetatable({}, { __mode = "k" }) :: any
+
+function ActionPose.now(): number
+	return workspace:GetServerTimeNow()
+end
+
+function ActionPose.playLocal(model: Model, clip: string, speed: number?)
+	overrides[model] = { clip = clip, start = ActionPose.now(), speed = speed or 1 }
+end
+
+function ActionPose.stopLocal(model: Model)
+	overrides[model] = nil
+end
+
+local function pivotFor(rig: Rig.Rig, joint: PoseLibrary.JointName): Vector3
+	if joint == "RootJoint" then
+		return Vector3.new(0, rig.hipLineY, 0)
+	elseif joint == "LeftHip" then
+		return Vector3.new(-rig.hipHalfWidth, rig.hipLineY, 0)
+	elseif joint == "RightHip" then
+		return Vector3.new(rig.hipHalfWidth, rig.hipLineY, 0)
+	end
+	return rig:c0(joint).Position -- Neck, shoulders: the joint itself
+end
+
+local function current(model: Model): (string?, number, number)
+	local now = ActionPose.now()
+	local override = overrides[model]
+	local name = model:GetAttribute("R6_Action")
+	local start = model:GetAttribute("R6_ActionStart")
+	local speed = model:GetAttribute("R6_ActionSpeed")
+	if override then
+		local clip = PoseLibrary.get(override.clip)
+		local elapsed = (now - override.start) * override.speed
+		if clip and (clip.loop or elapsed <= clip.duration) then
+			-- Prediction wins unless the server started something else afterwards.
+			if
+				not (
+					type(name) == "string"
+					and name ~= override.clip
+					and type(start) == "number"
+					and start > override.start
+				)
+			then
+				return override.clip, elapsed, 1
+			end
+		end
+		overrides[model] = nil
+	end
+	if type(name) ~= "string" or name == "" or type(start) ~= "number" then
+		return nil, 0, 0
+	end
+	local s = if type(speed) == "number" then speed else 1
+	return name, (now - start) * s, 1
+end
+
+function ActionPose.update(rig, sensor, _dt, _cfg, ctx)
+	local name, elapsed = current(rig.character)
+	if name == nil then
+		return
+	end
+	local clip = PoseLibrary.get(name)
+	if clip == nil then
+		return
+	end
+	local pose, weight = PoseLibrary.sample(clip, elapsed)
+	weight *= ctx.weight("R6_ActionWeight") * math.max(sensor.stateWeight, 0.35)
+	if weight <= 1e-3 then
+		return
+	end
+	for key, entry in pose do
+		local joint: any = key -- pose keys are joint names (validated by PoseLibrary conventions)
+		rig:add(joint, PoseLibrary.jointCFrame(entry, pivotFor(rig, joint), weight))
+	end
+end
+
+return ActionPose
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="6">
+          <Properties>
             <string name="Name">BodyLean</string>
             <string name="Source"><![CDATA[--!strict
 --[[
@@ -554,7 +671,7 @@ return BodyLean
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="6">
+        <Item class="ModuleScript" referent="7">
           <Properties>
             <string name="Name">Breathing</string>
             <string name="Source"><![CDATA[--!strict
@@ -598,7 +715,7 @@ return Breathing
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="7">
+        <Item class="ModuleScript" referent="8">
           <Properties>
             <string name="Name">HeadLook</string>
             <string name="Source"><![CDATA[--!strict
@@ -671,7 +788,7 @@ return HeadLook
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="8">
+        <Item class="ModuleScript" referent="9">
           <Properties>
             <string name="Name">LandingImpact</string>
             <string name="Source"><![CDATA[--!strict
@@ -718,7 +835,7 @@ return LandingImpact
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="9">
+        <Item class="ModuleScript" referent="10">
           <Properties>
             <string name="Name">TerrainAdaptation</string>
             <string name="Source"><![CDATA[--!strict
@@ -782,7 +899,7 @@ return TerrainAdaptation
           </Properties>
         </Item>
       </Item>
-      <Item class="ModuleScript" referent="10">
+      <Item class="ModuleScript" referent="11">
         <Properties>
           <string name="Name">LookNet</string>
           <string name="Source"><![CDATA[--!strict
@@ -866,7 +983,265 @@ return LookNet
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="11">
+      <Item class="ModuleScript" referent="12">
+        <Properties>
+          <string name="Name">PoseLibrary</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	PoseLibrary
+	Keyframed procedural poses for R6 (combat moves, reactions) with ZERO animation assets.
+
+	A pose = per-joint rotation (degrees, Part0 space, applied about the joint's natural
+	pivot) + optional translation (studs, Part0 space). Conventions (tested):
+	  * Shoulders / hips:  X+ swings the limb FORWARD (90 = pointing forward, 170 = overhead),
+	                       Z+ moves the hand towards +X (right arm: outwards, left arm: inwards).
+	  * RootJoint (torso): X+ leans BACK, Y+ twists LEFT, Z+ tilts LEFT. Pivot: hip line.
+	  * Neck:              X+ looks up, Y+ looks left.
+	Clips are sampled with world/server time so every client shows the same frame.
+
+	Attack clips are generated from the move timings (windup / active / recovery), so the
+	visible strike ALWAYS matches the server hitbox window.
+]]
+
+local R6Math = require(script.Parent.R6Math)
+
+export type JointName = "RootJoint" | "Neck" | "LeftHip" | "RightHip" | "LeftShoulder" | "RightShoulder"
+export type JointPose = { rot: Vector3, pos: Vector3? }
+export type Pose = { [string]: JointPose }
+export type Keyframe = { t: number, pose: Pose, ease: ((number) -> number)? }
+export type Clip = {
+	duration: number,
+	keys: { Keyframe },
+	blendIn: number,
+	blendOut: number,
+	loop: boolean?,
+}
+
+local PoseLibrary = {}
+
+local function outQuad(t: number): number
+	return 1 - (1 - t) * (1 - t)
+end
+local function outExpo(t: number): number
+	return if t >= 1 then 1 else 1 - 2 ^ (-10 * t)
+end
+local function inOutSine(t: number): number
+	return -(math.cos(math.pi * t) - 1) / 2
+end
+local function inQuad(t: number): number
+	return t * t
+end
+PoseLibrary.ease = { outQuad = outQuad, outExpo = outExpo, inOutSine = inOutSine, inQuad = inQuad }
+
+local NEUTRAL: Pose = {}
+PoseLibrary.NEUTRAL = NEUTRAL
+
+local JOINTS: { JointName } = { "RootJoint", "Neck", "LeftHip", "RightHip", "LeftShoulder", "RightShoulder" }
+PoseLibrary.JOINTS = JOINTS
+
+local function jp(x: number, y: number, z: number, pos: Vector3?): JointPose
+	return { rot = Vector3.new(x, y, z), pos = pos }
+end
+PoseLibrary.jp = jp
+
+-- Linear blend of two poses (missing joints = neutral).
+function PoseLibrary.blend(a: Pose, b: Pose, t: number): Pose
+	local out: Pose = {}
+	for _, name in JOINTS do
+		local joint = name
+		local ja, jb = a[joint], b[joint]
+		if ja or jb then
+			local ra = if ja then ja.rot else Vector3.zero
+			local rb = if jb then jb.rot else Vector3.zero
+			local pa = if ja and ja.pos then ja.pos else Vector3.zero
+			local pb = if jb and jb.pos then jb.pos else Vector3.zero
+			out[joint] = { rot = ra:Lerp(rb, t), pos = pa:Lerp(pb, t) }
+		end
+	end
+	return out
+end
+
+-- Samples a clip at `time` seconds. Returns the pose and the blend weight (0..1).
+function PoseLibrary.sample(clip: Clip, time: number): (Pose, number)
+	local duration = clip.duration
+	if clip.loop then
+		time %= duration
+	elseif time < 0 or time > duration then
+		return NEUTRAL, 0
+	end
+	local keys = clip.keys
+	local pose: Pose = keys[1].pose
+	for i = 1, #keys - 1 do
+		local a, b = keys[i], keys[i + 1]
+		if time >= a.t and time <= b.t then
+			local span = b.t - a.t
+			local k = if span > 0 then (time - a.t) / span else 1
+			local ease = b.ease or inOutSine
+			pose = PoseLibrary.blend(a.pose, b.pose, ease(k))
+			break
+		elseif i == #keys - 1 then
+			pose = b.pose
+		end
+	end
+	local weight = 1
+	if not clip.loop then
+		if clip.blendIn > 0 then
+			weight = math.min(weight, time / clip.blendIn)
+		end
+		if clip.blendOut > 0 then
+			weight = math.min(weight, (duration - time) / clip.blendOut)
+		end
+	end
+	return pose, math.clamp(weight, 0, 1)
+end
+
+--[[
+	Part0-space offset CFrame of one joint for a pose entry, rotating about the joint's
+	natural pivot. `pivot` comes from the rig (hip line for torso/hips, C0 position for
+	neck/shoulders).
+]]
+function PoseLibrary.jointCFrame(entry: JointPose, pivot: Vector3, weight: number): CFrame
+	local r = entry.rot * (math.pi / 180 * weight)
+	local rotation = CFrame.fromEulerAnglesYXZ(r.X, r.Y, r.Z)
+	local offset = R6Math.rotationAbout(pivot, rotation)
+	if entry.pos then
+		offset = CFrame.new(entry.pos * weight) * offset
+	end
+	return offset
+end
+
+export type AttackPoses = { windup: Pose, strike: Pose, follow: Pose? }
+export type Timing = { windup: number, active: number, recovery: number }
+
+--[[
+	Builds an attack clip whose keys line up with gameplay timings:
+	  0 -> windup      : neutral -> windup pose (anticipation, easeOut)
+	  windup -> +active : windup -> strike pose (explosive, outExpo) = hitbox window
+	  -> +recovery      : strike -> follow-through -> neutral
+]]
+function PoseLibrary.attack(poses: AttackPoses, timing: Timing): Clip
+	local t1 = timing.windup
+	local t2 = t1 + timing.active
+	local t3 = t2 + timing.recovery
+	local follow = poses.follow or poses.strike
+	return {
+		duration = t3,
+		blendIn = math.min(0.06, t1),
+		blendOut = math.min(0.12, timing.recovery),
+		keys = {
+			{ t = 0, pose = NEUTRAL },
+			{ t = t1, pose = poses.windup, ease = outQuad },
+			{ t = t2, pose = poses.strike, ease = outExpo },
+			{ t = t2 + timing.recovery * 0.45, pose = follow, ease = outQuad },
+			{ t = t3, pose = NEUTRAL, ease = inOutSine },
+		},
+	}
+end
+
+-- Held pose (block stance, idle guard): short blend in, loops until the action changes.
+function PoseLibrary.hold(pose: Pose, blendIn: number): Clip
+	return {
+		duration = 1,
+		blendIn = blendIn,
+		blendOut = 0,
+		loop = true,
+		keys = { { t = 0, pose = pose }, { t = 1, pose = pose } },
+	}
+end
+
+-- One-shot reaction: snap to `pose` then recover over `duration`.
+function PoseLibrary.reaction(pose: Pose, snap: number, duration: number): Clip
+	return {
+		duration = duration,
+		blendIn = 0,
+		blendOut = duration * 0.4,
+		keys = {
+			{ t = 0, pose = NEUTRAL },
+			{ t = snap, pose = pose, ease = outExpo },
+			{ t = duration, pose = NEUTRAL, ease = inOutSine },
+		},
+	}
+end
+
+------------------------------------------------------------------------------------
+-- Clip registry (combat code registers its own clips; defaults below are ready to use)
+------------------------------------------------------------------------------------
+
+local clips: { [string]: Clip } = {}
+
+function PoseLibrary.register(name: string, clip: Clip)
+	clips[name] = clip
+end
+
+function PoseLibrary.get(name: string): Clip?
+	return clips[name]
+end
+
+-- Generic reactions / stances (weapon-agnostic).
+PoseLibrary.register(
+	"Stagger",
+	PoseLibrary.reaction({
+		RootJoint = jp(14, 0, -6),
+		Neck = jp(18, 8, 0),
+		RightShoulder = jp(-15, 0, 20),
+		LeftShoulder = jp(-15, 0, -20),
+	}, 0.06, 0.45)
+)
+PoseLibrary.register(
+	"GuardBroken",
+	PoseLibrary.reaction({
+		RootJoint = jp(24, 0, 0, Vector3.new(0, -0.3, 0)),
+		Neck = jp(25, 0, 0),
+		RightShoulder = jp(40, 0, 70),
+		LeftShoulder = jp(40, 0, -70),
+		LeftHip = jp(-18, 0, 0),
+		RightHip = jp(10, 0, 0),
+	}, 0.08, 1.1)
+)
+PoseLibrary.register(
+	"Parried", -- attacker recoil after being parried
+	PoseLibrary.reaction({
+		RootJoint = jp(16, -12, 0),
+		RightShoulder = jp(150, 0, 35),
+		Neck = jp(12, 0, 0),
+	}, 0.07, 0.6)
+)
+PoseLibrary.register(
+	"DodgeLeft",
+	PoseLibrary.reaction({
+		RootJoint = jp(-10, 0, 22, Vector3.new(0, -0.6, 0)),
+		LeftHip = jp(20, 0, -15),
+		RightHip = jp(-10, 0, 25),
+		LeftShoulder = jp(30, 0, -40),
+		RightShoulder = jp(-20, 0, 30),
+	}, 0.08, 0.4)
+)
+PoseLibrary.register(
+	"DodgeRight",
+	PoseLibrary.reaction({
+		RootJoint = jp(-10, 0, -22, Vector3.new(0, -0.6, 0)),
+		RightHip = jp(20, 0, 15),
+		LeftHip = jp(-10, 0, -25),
+		RightShoulder = jp(30, 0, 40),
+		LeftShoulder = jp(-20, 0, -30),
+	}, 0.08, 0.4)
+)
+PoseLibrary.register(
+	"DodgeBack",
+	PoseLibrary.reaction({
+		RootJoint = jp(-16, 0, 0, Vector3.new(0, -0.7, 0)),
+		LeftHip = jp(35, 0, 0),
+		RightHip = jp(-25, 0, 0),
+		LeftShoulder = jp(40, 0, -15),
+		RightShoulder = jp(40, 0, 15),
+	}, 0.08, 0.4)
+)
+
+return PoseLibrary
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
         <Properties>
           <string name="Name">R6Math</string>
           <string name="Source"><![CDATA[--!strict
@@ -1039,7 +1414,7 @@ return R6Math
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="12">
+      <Item class="ModuleScript" referent="14">
         <Properties>
           <string name="Name">Rig</string>
           <string name="Source"><![CDATA[--!strict
@@ -1280,7 +1655,7 @@ return Rig
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="13">
+      <Item class="ModuleScript" referent="15">
         <Properties>
           <string name="Name">Sensor</string>
           <string name="Source"><![CDATA[--!strict
@@ -1439,7 +1814,7 @@ return Sensor
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="16">
         <Properties>
           <string name="Name">Spring</string>
           <string name="Source"><![CDATA[--!strict
@@ -1557,7 +1932,7 @@ return Spring
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="17">
         <Properties>
           <string name="Name">Types</string>
           <string name="Source"><![CDATA[--!strict
@@ -1589,11 +1964,11 @@ return {}
       </Item>
     </Item>
   </Item>
-  <Item class="ServerScriptService" referent="16">
+  <Item class="ServerScriptService" referent="18">
     <Properties>
       <string name="Name">ServerScriptService</string>
     </Properties>
-    <Item class="Script" referent="17">
+    <Item class="Script" referent="19">
       <Properties>
         <string name="Name">R6ProceduralDemo</string>
         <token name="RunContext">0</token>
@@ -1786,11 +2161,11 @@ spawnNpc("RockWalker", { rocks + Vector3.new(0, 0, 9), rocks + Vector3.new(0, 0,
 ]]></string>
       </Properties>
     </Item>
-    <Item class="Folder" referent="18">
+    <Item class="Folder" referent="20">
       <Properties>
         <string name="Name">R6ProceduralServer</string>
       </Properties>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">LookRelay</string>
           <string name="Source"><![CDATA[--!strict
@@ -1904,7 +2279,7 @@ return LookRelay
 ]]></string>
         </Properties>
       </Item>
-      <Item class="Script" referent="20">
+      <Item class="Script" referent="22">
         <Properties>
           <string name="Name">Main</string>
           <token name="RunContext">0</token>
@@ -1918,19 +2293,19 @@ LookRelay.start()
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="21">
+  <Item class="StarterPlayer" referent="23">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="22">
+    <Item class="StarterPlayerScripts" referent="24">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="23">
+      <Item class="Folder" referent="25">
         <Properties>
           <string name="Name">R6ProceduralClient</string>
         </Properties>
-        <Item class="LocalScript" referent="24">
+        <Item class="LocalScript" referent="26">
           <Properties>
             <string name="Name">R6ProceduralBootstrap</string>
             <string name="Source"><![CDATA[--!strict
@@ -1946,12 +2321,12 @@ Controller.start()
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="25">
+  <Item class="Workspace" referent="27">
     <Properties>
       <string name="Name">Workspace</string>
       <bool name="NeedsPivotMigration">false</bool>
     </Properties>
-    <Item class="Part" referent="26">
+    <Item class="Part" referent="28">
       <Properties>
         <string name="Name">Baseplate</string>
         <bool name="Anchored">true</bool>
@@ -1970,7 +2345,7 @@ Controller.start()
         </Vector3>
       </Properties>
     </Item>
-    <Item class="SpawnLocation" referent="27">
+    <Item class="SpawnLocation" referent="29">
       <Properties>
         <string name="Name">SpawnLocation</string>
         <bool name="Anchored">true</bool>

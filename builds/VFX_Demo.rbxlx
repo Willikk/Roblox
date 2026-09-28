@@ -1133,6 +1133,63 @@ return Ease
         </Properties>
         <Item class="ModuleScript" referent="9">
           <Properties>
+            <string name="Name">Block</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Block
+	Guarded hit: short white-steel sparks, a small flash, a tiny hitstop and a light
+	camera tap for the defender. params.target = defender.
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local CameraShaker = require(VFX.CameraShaker)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local Block = {} :: Types.Effect
+Block.maxDistance = 220
+
+local STEEL = Color3.fromRGB(225, 232, 245)
+
+function Block.preload()
+	Shapes.preload()
+end
+
+function Block.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+	Shapes.flash(position, STEEL, 1.6, 0.08, 4)
+	Particles.burst(
+		"Sparks",
+		VFXMath.lookAlong(position, -direction) * CFrame.Angles(-math.pi / 2, 0, 0),
+		12 * ctx.quality,
+		{
+			color = STEEL,
+			spread = 60,
+			sizeScale = 0.7,
+		}
+	)
+	if ctx.distance < 90 then
+		Hitstop.apply({ params.source, params.target }, 0.035)
+	end
+	local me = Players.LocalPlayer and Players.LocalPlayer.Character
+	if me and params.target == me then
+		CameraShaker.addTrauma(0.08)
+		CameraShaker.kick(direction, 0.3)
+	end
+end
+
+return Block
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
             <string name="Name">CraterRocks</string>
             <string name="Source"><![CDATA[--!strict
 --[[
@@ -1381,7 +1438,63 @@ return CraterRocks
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="10">
+        <Item class="ModuleScript" referent="11">
+          <Properties>
+            <string name="Name">FistImpact</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	FistImpact
+	Punch connect: ImpactBurst (sparks, flash, victim highlight, hitstop, camera) plus an
+	air-pressure shock ring facing the punch and, for heavy hits (variant bit 0), a second
+	wide ring and a dust puff. params.cframe LookVector = punch direction.
+]]
+
+local VFX = script.Parent.Parent
+local ImpactBurst = require(script.Parent.ImpactBurst)
+local Particles = require(VFX.Particles)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local FistImpact = {} :: Types.Effect
+FistImpact.maxDistance = 250
+
+local AIR = Color3.fromRGB(245, 245, 255)
+
+function FistImpact.preload()
+	Shapes.preload()
+	if ImpactBurst.preload then
+		ImpactBurst.preload()
+	end
+end
+
+function FistImpact.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local heavy = bit32.band(params.variant, 1) == 1
+	ImpactBurst.play({
+		name = "ImpactBurst",
+		cframe = params.cframe,
+		scale = params.scale,
+		color = params.color or Color3.fromRGB(255, 240, 215),
+		power = params.power * 0.8,
+		variant = params.variant,
+		seed = params.seed,
+		source = params.source,
+		target = params.target,
+	}, ctx)
+	local position = params.cframe.Position
+	local facing = VFXMath.alignToNormal(position, params.cframe.LookVector)
+	Shapes.ring(facing, 0.3, if heavy then 4.2 else 2.6, if heavy then 0.8 else 0.5, AIR, 0.18)
+	if heavy then
+		Shapes.ring(facing * CFrame.new(0, 0.8, 0), 0.5, 6, 0.5, AIR, 0.26, 0.05)
+		Particles.burst("Dust", facing, 6 * ctx.quality, { sizeScale = 0.6, speedScale = 1.2, spread = 40 })
+	end
+end
+
+return FistImpact
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="12">
           <Properties>
             <string name="Name">GroundSlam</string>
             <string name="Source"><![CDATA[--!strict
@@ -1444,7 +1557,71 @@ return GroundSlam
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="11">
+        <Item class="ModuleScript" referent="13">
+          <Properties>
+            <string name="Name">GuardBreak</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	GuardBreak
+	Posture shattered: glassy guard shards fly out, a violent ring, big flash, long
+	hitstop, and a desaturated impact punch for the two fighters.
+	params.target = the defender whose guard broke.
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local CameraShaker = require(VFX.CameraShaker)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local ScreenFlash = require(VFX.ScreenFlash)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local GuardBreak = {} :: Types.Effect
+GuardBreak.maxDistance = 320
+
+local SHARD = Color3.fromRGB(170, 215, 255)
+local HOT = Color3.fromRGB(255, 120, 80)
+
+function GuardBreak.preload()
+	Shapes.preload()
+end
+
+function GuardBreak.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+	Shapes.flash(position, Color3.new(1, 1, 1), 4.5, 0.16, 16)
+	Shapes.shards(position, SHARD, math.floor(10 * ctx.quality + 0.5), 28, ctx.rng)
+	Shapes.ring(VFXMath.alignToNormal(position, direction), 0.5, 6, 1, HOT, 0.28)
+	Shapes.ring(VFXMath.alignToNormal(position, Vector3.yAxis), 0.5, 7, 0.6, SHARD, 0.34, 0.04)
+	Particles.burst(
+		"Sparks",
+		VFXMath.alignToNormal(position, Vector3.yAxis),
+		26 * ctx.quality,
+		{ color = HOT, spread = 90 }
+	)
+	if params.target then
+		Shapes.highlight(params.target, HOT, 0.45, "VFX_GuardBreak", 0.2)
+	end
+	if ctx.distance < 100 then
+		Hitstop.apply({ params.source, params.target }, 0.16, { freezeVFX = true })
+	end
+	local me = Players.LocalPlayer and Players.LocalPlayer.Character
+	if me and (params.source == me or params.target == me) then
+		CameraShaker.addTrauma(if params.target == me then 0.5 else 0.25)
+		CameraShaker.kick(direction, 1.2)
+		ScreenFlash.impactFrame(0.05)
+		ScreenFlash.impact({ duration = 0.3, saturation = -0.35, contrast = 0.25, blur = 5 })
+	end
+end
+
+return GuardBreak
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="14">
           <Properties>
             <string name="Name">ImpactBurst</string>
             <string name="Source"><![CDATA[--!strict
@@ -1619,7 +1796,75 @@ return ImpactBurst
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="12">
+        <Item class="ModuleScript" referent="15">
+          <Properties>
+            <string name="Name">Parry</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Parry
+	The signature Deepwoken read: a big yellow star spark, a golden ring, a light pop,
+	sparks, and a heavy hitstop on both fighters (world VFX frozen too).
+	params.cframe = contact point (LookVector = blow direction), source = parrier,
+	target = parried attacker.
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local CameraShaker = require(VFX.CameraShaker)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local ScreenFlash = require(VFX.ScreenFlash)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local Parry = {} :: Types.Effect
+Parry.maxDistance = 300
+
+local GOLD = Color3.fromRGB(255, 214, 90)
+local WHITE_HOT = Color3.fromRGB(255, 250, 225)
+
+function Parry.preload()
+	Shapes.preload()
+	Particles.prewarm({ "Sparks" }, 3)
+end
+
+function Parry.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+	local power = math.clamp(params.power, 0.5, 3)
+
+	Shapes.flash(position, WHITE_HOT, 3.2 * power, 0.12, 14)
+	Shapes.star(position, GOLD, 5.5 * power, 0.16, ctx.rng)
+	Shapes.ring(VFXMath.alignToNormal(position, direction), 0.3, 4.5 * power, 0.7, GOLD, 0.22)
+	Particles.burst(
+		"Sparks",
+		VFXMath.lookAlong(position, -direction) * CFrame.Angles(-math.pi / 2, 0, 0),
+		30 * ctx.quality,
+		{
+			color = GOLD,
+			speedScale = 1.3,
+			spread = 80,
+		}
+	)
+
+	if ctx.distance < 90 then
+		Hitstop.apply({ params.source, params.target }, 0.12, { freezeVFX = true })
+	end
+	local me = Players.LocalPlayer and Players.LocalPlayer.Character
+	if me and (params.source == me or params.target == me) then
+		CameraShaker.addTrauma(0.22)
+		CameraShaker.fovPunch(-4)
+		ScreenFlash.impact({ duration = 0.14, brightness = 0.08, bloom = 1.4, contrast = 0.15 })
+	end
+end
+
+return Parry
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="16">
           <Properties>
             <string name="Name">Shockwave</string>
             <string name="Source"><![CDATA[--!strict
@@ -1820,7 +2065,7 @@ return Shockwave
 ]]></string>
           </Properties>
         </Item>
-        <Item class="ModuleScript" referent="13">
+        <Item class="ModuleScript" referent="17">
           <Properties>
             <string name="Name">Slash</string>
             <string name="Source"><![CDATA[--!strict
@@ -2008,8 +2253,53 @@ return Slash
 ]]></string>
           </Properties>
         </Item>
+        <Item class="ModuleScript" referent="18">
+          <Properties>
+            <string name="Name">Telegraph</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Telegraph
+	Perilous-attack warning (Deepwoken's red flash): the attacker's body flashes red twice
+	and a red flare pops at the chest. Played when an unparryable move starts; the
+	windup is the reaction time to DODGE. params.source = attacker.
+]]
+
+local VFX = script.Parent.Parent
+local Animator = require(VFX.Animator)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+
+local Telegraph = {} :: Types.Effect
+Telegraph.maxDistance = 350
+
+local RED = Color3.fromRGB(255, 40, 40)
+
+function Telegraph.preload()
+	Shapes.preload()
+end
+
+function Telegraph.play(params: Types.EffectParams, _ctx: Types.EffectContext)
+	local source = params.source
+	local chest = params.cframe.Position + Vector3.new(0, 0.8, 0)
+	if source and source:IsA("Model") then
+		local root = source:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") then
+			chest = root.Position + Vector3.new(0, 0.8, 0)
+		end
+		Shapes.highlight(source, RED, 0.22, "VFX_Telegraph", 0.05)
+		Animator.delay(0.24, function()
+			Shapes.highlight(source, RED, 0.3, "VFX_Telegraph", 0.25)
+		end, "ui")
+	end
+	Shapes.flash(chest, RED, 2.2, 0.2, 10)
+end
+
+return Telegraph
+]]></string>
+          </Properties>
+        </Item>
       </Item>
-      <Item class="ModuleScript" referent="14">
+      <Item class="ModuleScript" referent="19">
         <Properties>
           <string name="Name">Fade</string>
           <string name="Source"><![CDATA[--!strict
@@ -2121,7 +2411,7 @@ return Fade
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="15">
+      <Item class="ModuleScript" referent="20">
         <Properties>
           <string name="Name">Hitstop</string>
           <string name="Source"><![CDATA[--!strict
@@ -2251,7 +2541,7 @@ return Hitstop
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="16">
+      <Item class="ModuleScript" referent="21">
         <Properties>
           <string name="Name">Net</string>
           <string name="Source"><![CDATA[--!strict
@@ -2406,7 +2696,7 @@ return Net
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="17">
+      <Item class="ModuleScript" referent="22">
         <Properties>
           <string name="Name">Particles</string>
           <string name="Source"><![CDATA[--!strict
@@ -2614,7 +2904,7 @@ return Particles
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="18">
+      <Item class="ModuleScript" referent="23">
         <Properties>
           <string name="Name">Pool</string>
           <string name="Source"><![CDATA[--!strict
@@ -2793,7 +3083,7 @@ return Pool
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="19">
+      <Item class="ModuleScript" referent="24">
         <Properties>
           <string name="Name">Registry</string>
           <string name="Source"><![CDATA[--!strict
@@ -2811,6 +3101,11 @@ local NAMES: { string } = {
 	"CraterRocks",
 	"ImpactBurst",
 	"GroundSlam",
+	"Parry",
+	"Block",
+	"GuardBreak",
+	"FistImpact",
+	"Telegraph",
 }
 
 local Registry = {}
@@ -2840,7 +3135,7 @@ return Registry
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="20">
+      <Item class="ModuleScript" referent="25">
         <Properties>
           <string name="Name">ScreenFlash</string>
           <string name="Source"><![CDATA[--!strict
@@ -3017,7 +3312,252 @@ return ScreenFlash
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="21">
+      <Item class="ModuleScript" referent="26">
+        <Properties>
+          <string name="Name">Shapes</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Shapes
+	Pooled building blocks for combat feedback, shared by the combat effects:
+	  flash(position, color, size, duration, light)   neon sphere + point light pop
+	  ring(frame, r0, r1, width, color, duration)      expanding BeamArc ring (plane = frame XZ)
+	  star(position, color, length, duration, rng)     crossed neon spikes: the "parry spark"
+	  shards(position, color, count, speed, rng)       glassy chips flung out (guard break)
+	  highlight(model, color, duration, name)          body flash (restarts on re-trigger)
+]]
+
+local Animator = require(script.Parent.Animator)
+local Assets = require(script.Parent.Assets)
+local BeamArc = require(script.Parent.BeamArc)
+local Ease = require(script.Parent.Ease)
+local Fade = require(script.Parent.Fade)
+local Pool = require(script.Parent.Pool)
+local VFXMath = require(script.Parent.VFXMath)
+
+local Shapes = {}
+
+local flashPool: Pool.PartPool? = nil
+local spikePool: Pool.PartPool? = nil
+local shardPool: Pool.PartPool? = nil
+local ringPool: Pool.Pool<BeamArc.BeamArc>? = nil
+local highlights: { [Instance]: { highlight: Highlight, handle: Animator.Handle? } } = setmetatable(
+	{},
+	{ __mode = "k" }
+) :: any
+
+local function getFlashPool(): Pool.PartPool
+	if flashPool == nil then
+		local template = Instance.new("Part")
+		template.Shape = Enum.PartType.Ball
+		template.Material = Enum.Material.Neon
+		template.Size = Vector3.one
+		local light = Instance.new("PointLight")
+		light.Range = 16
+		light.Brightness = 8
+		light.Shadows = false
+		light.Parent = template
+		flashPool = Pool.fromTemplate(template, Assets.workspaceFolder(), 8)
+	end
+	return flashPool :: Pool.PartPool
+end
+
+local function getSpikePool(): Pool.PartPool
+	if spikePool == nil then
+		local template = Instance.new("Part")
+		template.Material = Enum.Material.Neon
+		template.Size = Vector3.new(0.12, 0.12, 1)
+		spikePool = Pool.fromTemplate(template, Assets.workspaceFolder(), 12)
+	end
+	return spikePool :: Pool.PartPool
+end
+
+local function getShardPool(): Pool.PartPool
+	if shardPool == nil then
+		local template = Instance.new("WedgePart")
+		template.Material = Enum.Material.Glass
+		template.Transparency = 0.15
+		template.Size = Vector3.new(0.15, 0.6, 0.5)
+		shardPool = Pool.fromTemplate(template, Assets.workspaceFolder(), 12)
+	end
+	return shardPool :: Pool.PartPool
+end
+
+local function getRingPool(): Pool.Pool<BeamArc.BeamArc>
+	if ringPool == nil then
+		ringPool = Pool.new(function(): BeamArc.BeamArc
+			return BeamArc.new(Assets.workspaceFolder(), 4, { segmentsPerPiece = 8 })
+		end, {
+			prewarm = 4,
+			onRelease = function(arc: BeamArc.BeamArc)
+				arc:setEnabled(false)
+			end,
+		})
+	end
+	return ringPool :: Pool.Pool<BeamArc.BeamArc>
+end
+
+function Shapes.flash(position: Vector3, color: Color3, size: number, duration: number, lightBrightness: number?)
+	local pool = getFlashPool()
+	local part = pool:acquire()
+	local snapshot = pool.snapshotOf[part]
+	part.Color = color
+	local light = part:FindFirstChildWhichIsA("PointLight")
+	if light then
+		light.Color = color
+	end
+	part.CFrame = CFrame.new(position)
+	local brightness = lightBrightness or 8
+	Animator.play(duration, function(t)
+		part.Size = Vector3.one * size * Ease.lerp(0.3, 1, Ease.outExpo(t))
+		Fade.apply(snapshot, 1 - Ease.inQuad(t))
+		if light then
+			light.Brightness = brightness * (1 - t)
+		end
+	end, {
+		group = "ui", -- a flash must pop even during hitstop
+		onComplete = function()
+			pool:release(part)
+		end,
+	})
+end
+
+function Shapes.ring(
+	frame: CFrame,
+	r0: number,
+	r1: number,
+	width: number,
+	color: Color3,
+	duration: number,
+	delay: number?
+)
+	local pool = getRingPool()
+	local ring = pool:acquire()
+	ring:setColor(color)
+	ring:setFrame(frame)
+	ring:set(math.max(r0, 0.01), 0, 2 * math.pi, function()
+		return 0
+	end, 1)
+	ring:setEnabled(true)
+	Animator.play(duration, function(t)
+		local r = Ease.lerp(r0, r1, Ease.outExpo(t))
+		local w = width * (1 - Ease.outQuad(t))
+		ring:set(math.max(r, 0.01), 0, 2 * math.pi, function()
+			return w
+		end, Ease.lerp(0, 1, Ease.inQuad(t)))
+	end, {
+		group = "ui",
+		delay = delay,
+		onComplete = function()
+			pool:release(ring)
+		end,
+	})
+end
+
+-- The classic "parry spark": 3-4 crossed neon spikes that stretch out and vanish.
+function Shapes.star(position: Vector3, color: Color3, length: number, duration: number, rng: Random)
+	local pool = getSpikePool()
+	local count = 4
+	for i = 1, count do
+		local part = pool:acquire()
+		local snapshot = pool.snapshotOf[part]
+		part.Color = color
+		local orientation = CFrame.new(position)
+			* CFrame.Angles(0, rng:NextNumber() * math.pi, 0)
+			* CFrame.Angles((i / count) * math.pi + rng:NextNumber() * 0.3, 0, 0)
+		local thickness = VFXMath.randomRange(rng, 0.1, 0.22)
+		local len = length * VFXMath.randomRange(rng, 0.7, 1.2)
+		Animator.play(duration, function(t)
+			local grow = Ease.outExpo(Ease.phase(t, 0, 0.35))
+			local thin = 1 - Ease.inQuad(Ease.phase(t, 0.25, 1))
+			part.Size = Vector3.new(thickness * thin + 0.01, thickness * thin + 0.01, len * grow + 0.05)
+			Animator.move(part, orientation)
+			Fade.apply(snapshot, thin)
+		end, {
+			group = "ui",
+			onComplete = function()
+				pool:release(part)
+			end,
+		})
+	end
+end
+
+-- Chips flung outward with fake gravity (anchored, no physics cost).
+function Shapes.shards(position: Vector3, color: Color3, count: number, speed: number, rng: Random)
+	local pool = getShardPool()
+	for _ = 1, count do
+		local part = pool:acquire()
+		local snapshot = pool.snapshotOf[part]
+		part.Color = color
+		local velocity = VFXMath.randomInCone(rng, Vector3.yAxis, math.rad(75))
+			* speed
+			* VFXMath.randomRange(rng, 0.6, 1.2)
+		local spin = Vector3.new(rng:NextNumber(-12, 12), rng:NextNumber(-12, 12), rng:NextNumber(-12, 12))
+		local scale = VFXMath.randomRange(rng, 0.7, 1.6)
+		part.Size = Vector3.new(0.15, 0.6, 0.5) * scale
+		local lifetime = VFXMath.randomRange(rng, 0.5, 0.8)
+		Animator.play(lifetime, function(_t, _dt, elapsed)
+			local p = position + velocity * elapsed + Vector3.new(0, -60, 0) * (elapsed * elapsed * 0.5)
+			local r = spin * elapsed
+			Animator.move(part, CFrame.new(p) * CFrame.fromEulerAnglesXYZ(r.X, r.Y, r.Z))
+			Fade.apply(snapshot, 1 - Ease.inQuad(math.clamp(elapsed / lifetime, 0, 1)))
+		end, {
+			onComplete = function()
+				pool:release(part)
+			end,
+		})
+	end
+end
+
+function Shapes.highlight(model: Instance, color: Color3, duration: number, name: string, peak: number?)
+	if not model:IsA("Model") then
+		return
+	end
+	local key = model
+	local entry = highlights[key]
+	if entry == nil or entry.highlight.Parent == nil or entry.highlight.Name ~= name then
+		local h = Instance.new("Highlight")
+		h.Name = name
+		h.OutlineTransparency = 1
+		h.DepthMode = Enum.HighlightDepthMode.Occluded
+		h.Adornee = model
+		h.Parent = model
+		entry = { highlight = h, handle = nil }
+		highlights[key] = entry
+	end
+	local e = entry :: { highlight: Highlight, handle: Animator.Handle? }
+	if e.handle then
+		e.handle:cancel()
+	end
+	local h = e.highlight
+	h.FillColor = color
+	h.Enabled = true
+	local start = peak or 0.1
+	h.FillTransparency = start
+	e.handle = Animator.play(duration, function(t)
+		h.FillTransparency = Ease.lerp(start, 1, Ease.outQuad(t))
+	end, {
+		group = "ui",
+		onComplete = function(cancelled)
+			if not cancelled then
+				h.Enabled = false
+				e.handle = nil
+			end
+		end,
+	})
+end
+
+function Shapes.preload()
+	getFlashPool()
+	getSpikePool()
+	getShardPool()
+	getRingPool()
+end
+
+return Shapes
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="27">
         <Properties>
           <string name="Name">Spring</string>
           <string name="Source"><![CDATA[--!strict
@@ -3135,7 +3675,7 @@ return Spring
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="22">
+      <Item class="ModuleScript" referent="28">
         <Properties>
           <string name="Name">TextureAnimator</string>
           <string name="Source"><![CDATA[--!strict
@@ -3284,7 +3824,7 @@ return TextureAnimator
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="23">
+      <Item class="ModuleScript" referent="29">
         <Properties>
           <string name="Name">Types</string>
           <string name="Source"><![CDATA[--!strict
@@ -3320,7 +3860,7 @@ return {}
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="24">
+      <Item class="ModuleScript" referent="30">
         <Properties>
           <string name="Name">VFXMath</string>
           <string name="Source"><![CDATA[--!strict
@@ -3454,11 +3994,11 @@ return VFXMath
         </Properties>
       </Item>
     </Item>
-    <Item class="Folder" referent="25">
+    <Item class="Folder" referent="31">
       <Properties>
         <string name="Name">VFXDemo</string>
       </Properties>
-      <Item class="ModuleScript" referent="26">
+      <Item class="ModuleScript" referent="32">
         <Properties>
           <string name="Name">DemoMoves</string>
           <string name="Source"><![CDATA[--!strict
@@ -3497,11 +4037,11 @@ return DemoMoves
       </Item>
     </Item>
   </Item>
-  <Item class="ServerScriptService" referent="27">
+  <Item class="ServerScriptService" referent="33">
     <Properties>
       <string name="Name">ServerScriptService</string>
     </Properties>
-    <Item class="Script" referent="28">
+    <Item class="Script" referent="34">
       <Properties>
         <string name="Name">VFXDemoServer</string>
         <token name="RunContext">0</token>
@@ -3660,11 +4200,11 @@ spawnDummy()
 ]]></string>
       </Properties>
     </Item>
-    <Item class="Folder" referent="29">
+    <Item class="Folder" referent="35">
       <Properties>
         <string name="Name">VFXServer</string>
       </Properties>
-      <Item class="Script" referent="30">
+      <Item class="Script" referent="36">
         <Properties>
           <string name="Name">Main</string>
           <token name="RunContext">0</token>
@@ -3676,7 +4216,7 @@ VFXService.start()
 ]]></string>
         </Properties>
       </Item>
-      <Item class="ModuleScript" referent="31">
+      <Item class="ModuleScript" referent="37">
         <Properties>
           <string name="Name">VFXService</string>
           <string name="Source"><![CDATA[--!strict
@@ -3930,19 +4470,19 @@ return VFXService
       </Item>
     </Item>
   </Item>
-  <Item class="StarterPlayer" referent="32">
+  <Item class="StarterPlayer" referent="38">
     <Properties>
       <string name="Name">StarterPlayer</string>
     </Properties>
-    <Item class="StarterPlayerScripts" referent="33">
+    <Item class="StarterPlayerScripts" referent="39">
       <Properties>
         <string name="Name">StarterPlayerScripts</string>
       </Properties>
-      <Item class="Folder" referent="34">
+      <Item class="Folder" referent="40">
         <Properties>
           <string name="Name">VFXClient</string>
         </Properties>
-        <Item class="LocalScript" referent="35">
+        <Item class="LocalScript" referent="41">
           <Properties>
             <string name="Name">VFXBootstrap</string>
             <string name="Source"><![CDATA[--!strict
@@ -3956,7 +4496,7 @@ VFXClient.start()
           </Properties>
         </Item>
       </Item>
-      <Item class="LocalScript" referent="36">
+      <Item class="LocalScript" referent="42">
         <Properties>
           <string name="Name">VFXDemoClient</string>
           <string name="Source"><![CDATA[--!strict
@@ -4064,12 +4604,12 @@ gui.Parent = player:WaitForChild("PlayerGui")
       </Item>
     </Item>
   </Item>
-  <Item class="Workspace" referent="37">
+  <Item class="Workspace" referent="43">
     <Properties>
       <string name="Name">Workspace</string>
       <bool name="NeedsPivotMigration">false</bool>
     </Properties>
-    <Item class="Part" referent="38">
+    <Item class="Part" referent="44">
       <Properties>
         <string name="Name">Baseplate</string>
         <bool name="Anchored">true</bool>
@@ -4088,7 +4628,7 @@ gui.Parent = player:WaitForChild("PlayerGui")
         </Vector3>
       </Properties>
     </Item>
-    <Item class="SpawnLocation" referent="39">
+    <Item class="SpawnLocation" referent="45">
       <Properties>
         <string name="Name">SpawnLocation</string>
         <bool name="Anchored">true</bool>

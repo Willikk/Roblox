@@ -63,6 +63,12 @@ Full math, default C0/C1 table and pivots: [r6_motor6d_math.md](references/r6_mo
 | `LandingImpact` | bouncy crouch proportional to fall speed (pelvis dips, legs tuck) | spring impulse |
 | `HeadLook` | camera / replicated / NPC target; torso takes 30% of yaw (legs counter-twist); neck compensates lean & bank; optional arm aim | `R6Math.lookAngles` |
 | `Breathing` | idle chest + arm sway; the minimal example of a custom layer | sine |
+| `ActionPose` | keyframed procedural poses (attacks, block, parry, stagger, dodge) from `PoseLibrary`, synced on server time via `R6_Action` / `R6_ActionStart` attributes, local prediction with `ActionPose.playLocal` | `PoseLibrary.sample` |
+
+`PoseLibrary` = animation without assets: per-joint degrees in Part0 space (shoulder X+ forward,
+90 horizontal, 170 overhead, Y for horizontal sweeps; RootJoint X+ back, Y+ twist left).
+`PoseLibrary.attack(poses, timing)` builds a clip whose strike frame matches gameplay timings
+(used by the `roblox-deepwoken-combat` skill).
 
 Custom layer = a module `{ name = "X", update = function(rig, sensor, dt, cfg, ctx) ... end }`
 appended to `Controller.layers`. Read `sensor` (velocity, acceleration, yawRate, grounded,
