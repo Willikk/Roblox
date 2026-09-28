@@ -36,6 +36,7 @@ CameraShaker.settings = {
 	exponent = 2,
 	kickScale = math.rad(4), -- radians of rotation for kick strength 1
 	intensity = 1, -- global user setting (0 disables)
+	stepFps = 0, -- > 0: noise advances in hard steps (choppy, low-framerate art styles)
 	reducedMotionScale = 0.25,
 }
 
@@ -102,7 +103,8 @@ local function apply(dt: number)
 
 	local s = scale()
 	local shake = (trauma ^ cfg.exponent) * s
-	local t = elapsed * cfg.frequency
+	local sampleTime = if cfg.stepFps > 0 then math.floor(elapsed * cfg.stepFps) / cfg.stepFps else elapsed
+	local t = sampleTime * cfg.frequency
 
 	local pitch = cfg.maxAngles.X * shake * math.noise(t, 11.3, 0.5) * 2
 	local yaw = cfg.maxAngles.Y * shake * math.noise(t, 27.1, 0.5) * 2

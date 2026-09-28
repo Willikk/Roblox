@@ -191,6 +191,9 @@ function Harness.new()
 		end,
 		CurrentCamera = nil,
 		Gravity = 196.2,
+		GetAttribute = function()
+			return nil
+		end,
 	}
 	return self
 end

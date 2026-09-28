@@ -1,0 +1,5 @@
+{"name":"DarkKit_ReplicatedStorage","tree":{"$className":"Folder",
+"DarkStyle":{"$path":"../.claude/skills/roblox-dark-pixel-style/src/shared/DarkStyle"},
+"Combat":{"$path":"../.claude/skills/roblox-deepwoken-combat/src/shared/Combat"},
+"VFX":{"$path":"../.claude/skills/roblox-mesh-vfx/src/shared/VFX"},
+"R6Procedural":{"$path":"../.claude/skills/roblox-r6-procedural-animation/src/shared/R6Procedural"}}}

@@ -1,0 +1,3 @@
+{"name":"DarkKit_StarterPlayerScripts","tree":{"$className":"Folder",
+"CombatClient":{"$path":"../.claude/skills/roblox-deepwoken-combat/src/client"},
+"DarkStyleClient":{"$path":"../.claude/skills/roblox-dark-pixel-style/src/client"}}}

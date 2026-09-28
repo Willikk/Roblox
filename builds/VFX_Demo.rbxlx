@@ -1,0 +1,4669 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">VFX</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Animator</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Animator
+	One frame loop for every running effect, instead of one Tween / RenderStepped
+	connection per part.
+
+	Why not only TweenService?
+	  * Multi-phase curves (spawn -> hold -> dissipate) from ONE normalized time value.
+	  * Time-scale groups: Hitstop can freeze every "world" effect for 80 ms, then resume.
+	  * CFrame writes are batched into a single workspace:BulkMoveTo call per frame.
+	  * A thrown error in one effect never kills the others (and cleanup still runs).
+	TweenService is still perfect for fire-and-forget single-property tweens.
+
+	Usage:
+		Animator.play(0.4, function(t, dt)
+			part.Transparency = Ease.inQuad(t)
+			Animator.move(part, origin * CFrame.Angles(0, t * math.pi, 0))
+		end, { group = "world", onComplete = function() pool:release(part) end })
+
+		Animator.setTimeScale("world", 0) -- freeze (hitstop)
+]]
+
+local RunService = game:GetService("RunService")
+
+export type StepFn = (t: number, dt: number, elapsed: number) -> ()
+export type CompleteFn = (cancelled: boolean) -> ()
+
+export type PlayOptions = {
+	group: string?, -- time-scale group, default "world"
+	delay: number?, -- seconds (time-scaled) before the first step
+	onComplete: CompleteFn?, -- always called once: finished, cancelled or errored
+}
+
+export type Handle = {
+	cancel: (self: Handle) -> (),
+	isDone: (self: Handle) -> boolean,
+}
+
+type Job = {
+	duration: number,
+	delay: number,
+	elapsed: number,
+	step: StepFn?,
+	onComplete: CompleteFn?,
+	group: string,
+	done: boolean,
+}
+
+local Animator = {}
+
+local jobs: { Job } = {}
+local timeScales: { [string]: number } = {}
+local moveParts: { BasePart } = {}
+local moveCFrames: { CFrame } = {}
+local connection: RBXScriptConnection? = nil
+
+local function finish(job: Job, cancelled: boolean)
+	if job.done then
+		return
+	end
+	job.done = true
+	local onComplete = job.onComplete
+	job.onComplete = nil
+	job.step = nil
+	if onComplete then
+		local ok, err = (pcall :: any)(onComplete, cancelled)
+		if not ok then
+			warn("[VFX.Animator] onComplete error:", err)
+		end
+	end
+end
+
+local function flushMoves()
+	if #moveParts > 0 then
+		workspace:BulkMoveTo(moveParts, moveCFrames, Enum.BulkMoveMode.FireCFrameChanged)
+		table.clear(moveParts)
+		table.clear(moveCFrames)
+	end
+end
+
+local completed: { Job } = {}
+local failed: { Job } = {}
+
+local function onFrame(dt: number)
+	local count = #jobs -- jobs added during this frame start next frame
+	for i = 1, count do
+		local job = jobs[i]
+		if job.done then
+			continue
+		end
+		local scaledDt = dt * (timeScales[job.group] or 1)
+		job.elapsed += scaledDt
+		local active = job.elapsed - job.delay
+		if active < 0 then
+			continue
+		end
+		local t = if job.duration == math.huge then 0 else math.min(active / job.duration, 1)
+		local step = job.step
+		if step then
+			local ok, err = (pcall :: any)(step, t, scaledDt, active)
+			if not ok then
+				warn("[VFX.Animator] step error:", err)
+				table.insert(failed, job)
+				continue
+			end
+		end
+		if t >= 1 then
+			table.insert(completed, job)
+		end
+	end
+
+	-- Flush CFrame writes BEFORE completion callbacks: a callback that parks a pooled
+	-- part must win over the part's last queued move.
+	flushMoves()
+
+	for _, job in completed do
+		finish(job, false)
+	end
+	for _, job in failed do
+		finish(job, true)
+	end
+	table.clear(completed)
+	table.clear(failed)
+
+	-- Compact finished jobs (stable order).
+	local write = 0
+	for read = 1, #jobs do
+		local job = jobs[read]
+		if not job.done then
+			write += 1
+			jobs[write] = job
+		end
+	end
+	for i = #jobs, write + 1, -1 do
+		jobs[i] = nil
+	end
+
+	if #jobs == 0 and #moveParts == 0 and connection then
+		connection:Disconnect()
+		connection = nil
+	end
+end
+
+local function ensureRunning()
+	if connection == nil then
+		local event = if RunService:IsClient() then RunService.PreRender else RunService.Heartbeat
+		connection = event:Connect(onFrame)
+	end
+end
+
+local HandleMethods = {}
+HandleMethods.__index = HandleMethods
+
+function HandleMethods.cancel(self: any)
+	finish(self._job, true)
+end
+
+function HandleMethods.isDone(self: any): boolean
+	return self._job.done
+end
+
+local function makeHandle(job: Job): Handle
+	return (setmetatable({ _job = job }, HandleMethods) :: any) :: Handle
+end
+
+-- Runs `step(t, dt, elapsed)` every frame for `duration` seconds (t goes 0 -> 1).
+-- The last call always receives t == 1 exactly.
+function Animator.play(duration: number, step: StepFn, options: PlayOptions?): Handle
+	local job: Job = {
+		duration = math.max(duration, 1e-3),
+		delay = if options and options.delay then options.delay else 0,
+		elapsed = 0,
+		step = step,
+		onComplete = options and options.onComplete,
+		group = if options and options.group then options.group else "world",
+		done = false,
+	}
+	table.insert(jobs, job)
+	ensureRunning()
+	return makeHandle(job)
+end
+
+-- Runs `step(dt, elapsed)` every frame until the handle is cancelled.
+function Animator.bind(step: (dt: number, elapsed: number) -> (), options: PlayOptions?): Handle
+	return Animator.play(math.huge, function(_t, dt, elapsed)
+		step(dt, elapsed)
+	end, options)
+end
+
+-- Time-scaled delay (respects hitstop freezes, unlike task.delay).
+function Animator.delay(seconds: number, callback: () -> (), group: string?): Handle
+	return Animator.play(1e-3, function() end, {
+		delay = seconds,
+		group = group,
+		onComplete = function(cancelled)
+			if not cancelled then
+				callback()
+			end
+		end,
+	})
+end
+
+function Animator.setTimeScale(group: string, scale: number)
+	timeScales[group] = math.max(scale, 0)
+end
+
+function Animator.getTimeScale(group: string): number
+	return timeScales[group] or 1
+end
+
+-- Queues a CFrame write, flushed once per frame with workspace:BulkMoveTo.
+function Animator.move(part: BasePart, cframe: CFrame)
+	table.insert(moveParts, part)
+	table.insert(moveCFrames, cframe)
+	ensureRunning()
+end
+
+function Animator.activeCount(): number
+	return #jobs
+end
+
+-- Test hook: advances one frame manually.
+Animator._step = onFrame
+
+return Animator
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Assets</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Assets
+	Template lookup, preloading and shared raycast filters.
+
+	Expected (optional) hierarchy - every effect falls back to procedural geometry when a
+	template is missing, so the library works in an empty baseplate:
+
+	ReplicatedStorage
+	└── Assets
+	    └── VFX
+	        ├── Meshes
+	        │   ├── Slashes      MeshPart "Slash", "SlashCore"      (arc in XZ plane, opens to -Z)
+	        │   ├── Shockwaves   MeshPart "Shockwave"               (ring in XZ plane, Y = up)
+	        │   └── Spikes       MeshPart "Rock1", "Rock2", ...     (optional crater rocks)
+	        ├── Particles        ParticleEmitter "Sparks", "Dust", "Embers" (optional overrides)
+	        ├── Textures         Decal/Texture templates, flipbook frames
+	        └── Sounds
+]]
+
+local ContentProvider = game:GetService("ContentProvider")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Assets = {}
+
+local cache: { [string]: Instance } = {}
+local vfxFolder: Folder? = nil
+
+local function root(): Instance?
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	return assets and assets:FindFirstChild("VFX")
+end
+
+-- Finds `ReplicatedStorage.Assets.VFX.<path>` where path is "Meshes/Slashes/Slash".
+function Assets.find(path: string): Instance?
+	local cached = cache[path]
+	if cached and cached.Parent then
+		return cached
+	end
+	local node = root()
+	for segment in string.gmatch(path, "[^/]+") do
+		if node == nil then
+			break
+		end
+		node = node:FindFirstChild(segment)
+	end
+	-- Only cache hits: assets may stream in later (StreamingEnabled / delayed loading).
+	if node then
+		cache[path] = node
+	end
+	return node
+end
+
+function Assets.findPart(path: string): BasePart?
+	local inst = Assets.find(path)
+	return if inst and inst:IsA("BasePart") then inst else nil
+end
+
+-- Client-only container for effect instances (never replicated: created locally).
+function Assets.workspaceFolder(): Folder
+	local folder = vfxFolder
+	if folder and folder.Parent then
+		return folder
+	end
+	local existing = workspace:FindFirstChild("VFX")
+	if existing and existing:IsA("Folder") then
+		vfxFolder = existing
+		return existing
+	end
+	local created = Instance.new("Folder")
+	created.Name = "VFX"
+	created.Parent = workspace
+	vfxFolder = created
+	return created
+end
+
+--[[
+	Preloads every mesh/texture/sound under Assets.VFX so the FIRST hit does not hitch
+	while the engine downloads the asset. Call once from the client bootstrap.
+]]
+function Assets.preloadAsync()
+	local r = root()
+	if r then
+		local ok, err = pcall(function()
+			ContentProvider:PreloadAsync({ r })
+		end)
+		if not ok then
+			warn("[VFX.Assets] preload failed:", err)
+		end
+	end
+end
+
+--[[
+	RaycastParams for ground detection: ignores every character and every effect
+	(so shockwaves never align to a player or to another effect) and respects
+	CanCollide (so invisible trigger volumes are ignored too).
+]]
+function Assets.groundParams(extraIgnore: { Instance }?): RaycastParams
+	local ignore: { Instance } = { Assets.workspaceFolder() }
+	for _, player in Players:GetPlayers() do
+		if player.Character then
+			table.insert(ignore, player.Character)
+		end
+	end
+	if extraIgnore then
+		for _, inst in extraIgnore do
+			table.insert(ignore, inst)
+		end
+	end
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = ignore
+	params.IgnoreWater = true
+	params.RespectCanCollide = true
+	return params
+end
+
+-- Color + material of whatever the ray hit (Terrain or BasePart), for debris/dust.
+function Assets.surfaceLook(result: RaycastResult): (Color3, Enum.Material)
+	local hit = result.Instance
+	if hit:IsA("Terrain") then
+		local ok, color = pcall(function()
+			return hit:GetMaterialColor(result.Material)
+		end)
+		return if ok then color else Color3.fromRGB(110, 105, 100), result.Material
+	elseif hit:IsA("BasePart") then
+		return hit.Color, hit.Material
+	end
+	return Color3.fromRGB(110, 105, 100), Enum.Material.Slate
+end
+
+return Assets
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="4">
+        <Properties>
+          <string name="Name">BeamArc</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	BeamArc
+	A circular arc (or full ring) drawn with Beams whose Bezier handles follow the circle.
+	Used as the zero-asset fallback for slashes and shockwaves, and useful on its own for
+	wind rings, sword trails and aura loops.
+
+	The arc lives in the holder's local XZ plane (Y = up); angles start at -Z (forward)
+	and grow counter-clockwise (towards -X). Each Beam covers <= 90 deg so the Bezier
+	stays within 0.03% of a true circle.
+
+	Usage:
+		local arc = BeamArc.new(folder, 2) -- 2 pieces
+		arc:setFrame(cframe)
+		arc:set(radius, -math.rad(80), math.rad(80), function(u) return math.sin(math.pi * u) end, 0.2)
+]]
+
+local VFXMath = require(script.Parent.VFXMath)
+
+export type WidthFn = (u: number) -> number
+
+export type BeamArc = {
+	holder: BasePart,
+	beams: { Beam },
+	attachments: { Attachment },
+	setFrame: (self: BeamArc, cframe: CFrame) -> (),
+	set: (
+		self: BeamArc,
+		radius: number,
+		startAngle: number,
+		endAngle: number,
+		width: WidthFn,
+		transparency: number
+	) -> (),
+	setColor: (self: BeamArc, color: Color3) -> (),
+	setEnabled: (self: BeamArc, enabled: boolean) -> (),
+}
+
+export type Options = {
+	color: Color3?,
+	lightEmission: number?,
+	lightInfluence: number?,
+	faceCamera: boolean?,
+	texture: string?,
+	textureLength: number?,
+	zOffset: number?,
+	segmentsPerPiece: number?,
+}
+
+local BeamArc = {}
+BeamArc.__index = BeamArc
+
+function BeamArc.new(parent: Instance, pieces: number, options: Options?): BeamArc
+	local opts: Options = options or {}
+	local holder = Instance.new("Part")
+	holder.Name = "BeamArc"
+	holder.Anchored = true
+	holder.CanCollide = false
+	holder.CanTouch = false
+	holder.CanQuery = false
+	holder.CastShadow = false
+	holder.Transparency = 1
+	holder.Size = Vector3.new(0.1, 0.1, 0.1)
+	holder.CFrame = CFrame.new(0, -5e4, 0)
+
+	local attachments: { Attachment } = {}
+	for i = 1, pieces + 1 do
+		local a = Instance.new("Attachment")
+		a.Name = `A{i}`
+		a.Parent = holder
+		attachments[i] = a
+	end
+
+	local beams: { Beam } = {}
+	for i = 1, pieces do
+		local beam = Instance.new("Beam")
+		beam.Attachment0 = attachments[i]
+		beam.Attachment1 = attachments[i + 1]
+		beam.FaceCamera = if opts.faceCamera == nil then true else opts.faceCamera
+		beam.LightEmission = opts.lightEmission or 1
+		beam.LightInfluence = opts.lightInfluence or 0
+		beam.Segments = opts.segmentsPerPiece or 12
+		beam.Color = ColorSequence.new(opts.color or Color3.new(1, 1, 1))
+		beam.ZOffset = opts.zOffset or 0
+		if opts.texture then
+			beam.Texture = opts.texture
+			beam.TextureMode = Enum.TextureMode.Stretch
+			beam.TextureLength = opts.textureLength or 1
+		end
+		beam.Enabled = false
+		beam.Parent = holder
+		beams[i] = beam
+	end
+
+	holder.Parent = parent
+
+	local self = setmetatable({
+		holder = holder,
+		beams = beams,
+		attachments = attachments,
+	}, BeamArc)
+	return (self :: any) :: BeamArc
+end
+
+function BeamArc.setFrame(self: BeamArc, cframe: CFrame)
+	self.holder.CFrame = cframe
+end
+
+-- `width(u)` receives u in [0, 1] along the arc (0 = start, 1 = end).
+function BeamArc.set(
+	self: BeamArc,
+	radius: number,
+	startAngle: number,
+	endAngle: number,
+	width: WidthFn,
+	transparency: number
+)
+	local pieces = #self.beams
+	local sweep = (endAngle - startAngle) / pieces
+	local curve = VFXMath.arcCurveSize(radius, math.abs(sweep))
+	-- Beams handles follow +X of attachment0 and -X of attachment1: when the arc runs
+	-- clockwise (negative sweep) the tangents flip, which arcAttachmentCFrame handles
+	-- through the sign of `direction`.
+	local direction = if sweep >= 0 then 1 else -1
+	local seq = NumberSequence.new(math.clamp(transparency, 0, 1))
+
+	for i, attachment in self.attachments do
+		local angle = startAngle + sweep * (i - 1)
+		local cf = VFXMath.arcAttachmentCFrame(radius, angle)
+		if direction < 0 then
+			cf *= CFrame.Angles(0, math.pi, 0) -- flip X (tangent) and Z, keep Y up
+		end
+		attachment.CFrame = cf
+	end
+	for i, beam in self.beams do
+		beam.CurveSize0 = curve
+		beam.CurveSize1 = curve
+		beam.Width0 = math.max(width((i - 1) / pieces), 0)
+		beam.Width1 = math.max(width(i / pieces), 0)
+		beam.Transparency = seq
+	end
+end
+
+function BeamArc.setColor(self: BeamArc, color: Color3)
+	local seq = ColorSequence.new(color)
+	for _, beam in self.beams do
+		beam.Color = seq
+	end
+end
+
+function BeamArc.setEnabled(self: BeamArc, enabled: boolean)
+	for _, beam in self.beams do
+		beam.Enabled = enabled
+	end
+	if not enabled then
+		self.holder.CFrame = CFrame.new(0, -5e4, 0)
+	end
+end
+
+return BeamArc
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="5">
+        <Properties>
+          <string name="Name">CameraShaker</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	CameraShaker
+	Trauma-based Perlin shake + directional kick springs + FOV punch.
+
+	Model ("Juicing your cameras", Squirrel Eiserloh, GDC 2016):
+	  trauma in [0, 1] is added by hits and decays linearly; shake = trauma^2, so small hits
+	  barely move the camera while stacked heavy hits escalate. Offsets come from smooth
+	  math.noise (not random jitter), which reads as "impact" instead of "glitch".
+
+	Integration with the default (or any) camera script, without drift:
+	  * Camera.Value - 1 : remove last frame's offset if nothing else moved the camera;
+	  * Camera.Value + 1 : apply this frame's offset on top of the camera script's result.
+	  The camera scripts therefore never see (nor accumulate) our offset.
+
+	Respects GuiService.ReducedMotionEnabled (accessibility) by scaling everything down.
+
+	Usage (client only):
+		CameraShaker.addTrauma(0.4)
+		CameraShaker.kick(hitDirection, 1)   -- world direction the blow travels
+		CameraShaker.fovPunch(-6)            -- degrees, springs back
+]]
+
+local GuiService = game:GetService("GuiService")
+local RunService = game:GetService("RunService")
+
+local Spring = require(script.Parent.Spring)
+
+local CameraShaker = {}
+
+CameraShaker.settings = {
+	maxAngles = Vector3.new(math.rad(2.2), math.rad(2.2), math.rad(3.5)), -- pitch, yaw, roll
+	maxOffset = Vector3.new(0.25, 0.25, 0.1), -- studs, camera space
+	frequency = 16, -- noise samples per second (higher = more violent)
+	traumaDecay = 1.3, -- trauma removed per second
+	exponent = 2,
+	kickScale = math.rad(4), -- radians of rotation for kick strength 1
+	intensity = 1, -- global user setting (0 disables)
+	stepFps = 0, -- > 0: noise advances in hard steps (choppy, low-framerate art styles)
+	reducedMotionScale = 0.25,
+}
+
+local BIND_UNDO = "VFX_CameraShakeUndo"
+local BIND_APPLY = "VFX_CameraShakeApply"
+
+local trauma = 0
+local elapsed = 0
+local rotationKick = Spring.new(Vector3.zero, 6.5, 0.42)
+local fovSpring = Spring.new(Vector3.zero, 4.5, 0.55)
+
+local bound = false
+local lastBase: CFrame? = nil
+local lastApplied: CFrame? = nil
+local lastFovBase: number? = nil
+local lastFovApplied: number? = nil
+
+local function scale(): number
+	local s = CameraShaker.settings.intensity
+	if GuiService.ReducedMotionEnabled then
+		s *= CameraShaker.settings.reducedMotionScale
+	end
+	return s
+end
+
+local function nearlyEqual(a: CFrame, b: CFrame): boolean
+	return a.Position:FuzzyEq(b.Position, 1e-4)
+		and a.LookVector:FuzzyEq(b.LookVector, 1e-5)
+		and a.UpVector:FuzzyEq(b.UpVector, 1e-5)
+end
+
+local function isSettled(): boolean
+	return trauma <= 0
+		and rotationKick.position.Magnitude < 1e-4
+		and rotationKick.velocity.Magnitude < 1e-3
+		and math.abs(fovSpring.position.X) < 1e-3
+		and math.abs(fovSpring.velocity.X) < 1e-2
+end
+
+local function undo()
+	local camera = workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+	if lastApplied and lastBase and nearlyEqual(camera.CFrame, lastApplied) then
+		camera.CFrame = lastBase
+	end
+	if lastFovApplied and lastFovBase and math.abs(camera.FieldOfView - lastFovApplied) < 1e-3 then
+		camera.FieldOfView = lastFovBase
+	end
+	lastApplied, lastBase, lastFovApplied, lastFovBase = nil, nil, nil, nil
+end
+
+local unbind: () -> ()
+
+local function apply(dt: number)
+	local camera = workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+	local cfg = CameraShaker.settings
+	elapsed += dt
+	trauma = math.max(trauma - cfg.traumaDecay * dt, 0)
+
+	local s = scale()
+	local shake = (trauma ^ cfg.exponent) * s
+	local sampleTime = if cfg.stepFps > 0 then math.floor(elapsed * cfg.stepFps) / cfg.stepFps else elapsed
+	local t = sampleTime * cfg.frequency
+
+	local pitch = cfg.maxAngles.X * shake * math.noise(t, 11.3, 0.5) * 2
+	local yaw = cfg.maxAngles.Y * shake * math.noise(t, 27.1, 0.5) * 2
+	local roll = cfg.maxAngles.Z * shake * math.noise(t, 43.7, 0.5) * 2
+	local offset = Vector3.new(
+		cfg.maxOffset.X * shake * math.noise(t, 59.9, 0.5) * 2,
+		cfg.maxOffset.Y * shake * math.noise(t, 71.3, 0.5) * 2,
+		cfg.maxOffset.Z * shake * math.noise(t, 83.1, 0.5) * 2
+	)
+
+	local kick = rotationKick:update(dt) * s
+	local fovDelta = fovSpring:update(dt).X * s
+
+	local base = camera.CFrame
+	local shaken = base * CFrame.new(offset) * CFrame.fromEulerAnglesYXZ(pitch + kick.X, yaw + kick.Y, roll + kick.Z)
+	camera.CFrame = shaken
+	lastBase, lastApplied = base, shaken
+
+	if math.abs(fovDelta) > 1e-3 then
+		local fovBase = camera.FieldOfView
+		camera.FieldOfView = math.clamp(fovBase + fovDelta, 1, 120)
+		lastFovBase, lastFovApplied = fovBase, camera.FieldOfView
+	end
+
+	if isSettled() then
+		unbind()
+	end
+end
+
+local undoBound = false
+
+local function bind()
+	if not undoBound then
+		-- The undo step stays bound for the session: it is a no-op when idle.
+		undoBound = true
+		RunService:BindToRenderStep(BIND_UNDO, Enum.RenderPriority.Camera.Value - 1, undo)
+	end
+	if bound then
+		return
+	end
+	bound = true
+	RunService:BindToRenderStep(BIND_APPLY, Enum.RenderPriority.Camera.Value + 1, apply)
+end
+
+function unbind()
+	if not bound then
+		return
+	end
+	bound = false
+	RunService:UnbindFromRenderStep(BIND_APPLY)
+end
+
+-- amount: 0.1 light jab, 0.3 heavy hit, 0.6 explosion, 1 = max.
+function CameraShaker.addTrauma(amount: number)
+	if amount <= 0 or CameraShaker.settings.intensity <= 0 then
+		return
+	end
+	trauma = math.clamp(trauma + amount, 0, 1)
+	bind()
+end
+
+-- Trauma with linear distance falloff (for shockwaves felt by bystanders).
+function CameraShaker.addTraumaAt(amount: number, origin: Vector3, radius: number)
+	local camera = workspace.CurrentCamera
+	if camera == nil then
+		return
+	end
+	local d = (camera.CFrame.Position - origin).Magnitude
+	local falloff = 1 - math.clamp(d / radius, 0, 1)
+	CameraShaker.addTrauma(amount * falloff * falloff)
+end
+
+-- Directional punch: the view jerks along `worldDirection` (direction the blow travels).
+function CameraShaker.kick(worldDirection: Vector3, strength: number)
+	local camera = workspace.CurrentCamera
+	if camera == nil or worldDirection.Magnitude < 1e-4 or CameraShaker.settings.intensity <= 0 then
+		return
+	end
+	local d = camera.CFrame:VectorToObjectSpace(worldDirection.Unit)
+	local k = CameraShaker.settings.kickScale * strength * 12 -- velocity impulse (rad/s)
+	rotationKick:impulse(Vector3.new(d.Y * k, -d.X * k, -d.X * k * 0.6))
+	bind()
+end
+
+-- Negative = zoom in punch (feels like a heavy impact), positive = zoom out (dash).
+function CameraShaker.fovPunch(degrees: number)
+	if CameraShaker.settings.intensity <= 0 then
+		return
+	end
+	fovSpring.position += Vector3.new(degrees, 0, 0)
+	bind()
+end
+
+function CameraShaker.stop()
+	trauma = 0
+	rotationKick:reset(Vector3.zero)
+	fovSpring:reset(Vector3.zero)
+	unbind()
+end
+
+function CameraShaker.getTrauma(): number
+	return trauma
+end
+
+return CameraShaker
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="6">
+        <Properties>
+          <string name="Name">Client</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Client
+	Client-side VFX dispatcher: receives compact packets from the server, culls by
+	distance, scales by adaptive quality, and plays effects locally.
+
+	Usage (LocalScript):
+		local VFXClient = require(ReplicatedStorage.VFX.Client)
+		VFXClient.start()
+
+		-- Client-side prediction (instant feedback for the attacker; the server then
+		-- broadcasts to everybody else with `exclude = attacker`):
+		VFXClient.play("Slash", { cframe = slashFrame, power = 1.5, seed = seed })
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local Assets = require(script.Parent.Assets)
+local Net = require(script.Parent.Net)
+local Registry = require(script.Parent.Registry)
+local Types = require(script.Parent.Types)
+
+export type PlayParams = {
+	cframe: CFrame,
+	scale: number?,
+	color: Color3?,
+	power: number?,
+	variant: number?,
+	seed: number?,
+	source: Instance?,
+	target: Instance?,
+}
+
+local Client = {}
+
+Client.settings = {
+	quality = 1, -- user setting ceiling (0.25 .. 1)
+	adaptiveQuality = true, -- lower quality automatically when FPS drops
+	distanceScale = 1, -- multiplies every effect's maxDistance
+	defaultMaxDistance = 400,
+}
+
+local effects: { [string]: Types.Effect } = {}
+local started = false
+local adaptiveQuality = 1
+
+-- Registers an effect implemented outside VFX/Effects (themes, game-specific effects).
+-- The name must also be listed in Registry.luau to travel over the network.
+function Client.registerEffect(name: string, effect: Types.Effect)
+	effects[name] = effect
+	if started and effect.preload then
+		task.spawn(effect.preload)
+	end
+end
+
+local function loadEffect(name: string): Types.Effect?
+	local cached = effects[name]
+	if cached then
+		return cached
+	end
+	local moduleScript = script.Parent.Effects:FindFirstChild(name)
+	if moduleScript == nil or not moduleScript:IsA("ModuleScript") then
+		warn(`[VFX.Client] no effect module named {name}`)
+		return nil
+	end
+	local effect = (require :: any)(moduleScript) :: Types.Effect
+	effects[name] = effect
+	return effect
+end
+
+function Client.quality(): number
+	return math.clamp(math.min(Client.settings.quality, adaptiveQuality), 0.25, 1)
+end
+
+local function dispatch(params: Types.EffectParams)
+	local effect = loadEffect(params.name)
+	if effect == nil then
+		return
+	end
+	local camera = workspace.CurrentCamera
+	local distance = if camera then (camera.CFrame.Position - params.cframe.Position).Magnitude else 0
+	local maxDistance = (effect.maxDistance or Client.settings.defaultMaxDistance) * Client.settings.distanceScale
+	if distance > maxDistance then
+		return
+	end
+	local character = Players.LocalPlayer and Players.LocalPlayer.Character
+	local ctx: Types.EffectContext = {
+		quality = Client.quality(),
+		distance = distance,
+		isLocalSource = character ~= nil and params.source == character,
+		isLocalTarget = character ~= nil and params.target == character,
+		rng = Random.new(params.seed),
+	}
+	local ok, err = (pcall :: any)(effect.play, params, ctx)
+	if not ok then
+		warn(`[VFX.Client] {params.name} failed:`, err)
+	end
+end
+
+-- Plays an effect locally (prediction, cosmetics, UI-driven effects).
+function Client.play(name: string, p: PlayParams)
+	dispatch({
+		name = name,
+		cframe = p.cframe,
+		scale = p.scale or 1,
+		color = p.color,
+		power = p.power or 1,
+		variant = p.variant or 0,
+		seed = p.seed or math.random(0, 65535),
+		source = p.source,
+		target = p.target,
+	})
+end
+
+local function onPacket(payload: any, instances: any)
+	local records = Net.decode(payload)
+	if records == nil then
+		return
+	end
+	local list: { any } = if type(instances) == "table" then instances else {}
+	for _, record in records do
+		local name = Registry.nameOf(record.id)
+		if name == nil then
+			continue
+		end
+		local source = list[record.sourceIndex]
+		local target = list[record.targetIndex]
+		dispatch({
+			name = name,
+			cframe = record.cframe,
+			scale = record.scale,
+			color = record.color,
+			power = record.power,
+			variant = record.variant,
+			seed = record.seed,
+			source = if typeof(source) == "Instance" then source else nil,
+			target = if typeof(target) == "Instance" then target else nil,
+		})
+	end
+end
+
+local function startAdaptiveQuality()
+	local samples = 0
+	local total = 0
+	RunService.PostSimulation:Connect(function(dt)
+		if not Client.settings.adaptiveQuality then
+			adaptiveQuality = 1
+			return
+		end
+		samples += 1
+		total += dt
+		if samples >= 90 then
+			local fps = samples / total
+			if fps < 40 then
+				adaptiveQuality = math.max(0.35, adaptiveQuality - 0.15)
+			elseif fps > 55 then
+				adaptiveQuality = math.min(1, adaptiveQuality + 0.05)
+			end
+			samples, total = 0, 0
+		end
+	end)
+end
+
+function Client.start()
+	if started then
+		return
+	end
+	started = true
+
+	for _, name in Registry.names() do
+		if effects[name] == nil and script.Parent.Effects:FindFirstChild(name) == nil then
+			continue -- provided at runtime by Client.registerEffect
+		end
+		local effect = loadEffect(name)
+		if effect and effect.preload then
+			local ok, err = (pcall :: any)(effect.preload)
+			if not ok then
+				warn(`[VFX.Client] preload {name} failed:`, err)
+			end
+		end
+	end
+	task.spawn(Assets.preloadAsync)
+	startAdaptiveQuality()
+
+	local remotes = ReplicatedStorage:WaitForChild("VFXRemotes")
+	local unreliable = remotes:WaitForChild("Unreliable") :: UnreliableRemoteEvent
+	local reliable = remotes:WaitForChild("Reliable") :: RemoteEvent
+	unreliable.OnClientEvent:Connect(onPacket)
+	reliable.OnClientEvent:Connect(onPacket)
+end
+
+return Client
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="7">
+        <Properties>
+          <string name="Name">Ease</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Ease
+	Pure easing curves + phase helpers used by every effect.
+
+	All curves map t in [0, 1] -> [0, 1] (back/elastic overshoot outside that range
+	on purpose). Pure Luau: no Roblox services, unit-tested under Lune.
+
+	Usage:
+		local k = Ease.outExpo(Ease.phase(t, 0, 0.15)) -- 0..1 during the first 15% of life
+		local fade = 1 - Ease.inQuad(Ease.phase(t, 0.3, 1))
+]]
+
+export type EaseFn = (t: number) -> number
+
+local Ease = {}
+
+local PI = math.pi
+local HALF_PI = math.pi / 2
+
+-- Maps t from the sub-range [a, b] to [0, 1] and clamps. The core tool for
+-- multi-phase effects (spawn / hold / dissipate) driven by one normalized time.
+function Ease.phase(t: number, a: number, b: number): number
+	if b <= a then
+		return if t >= b then 1 else 0
+	end
+	return math.clamp((t - a) / (b - a), 0, 1)
+end
+
+function Ease.lerp(a: number, b: number, t: number): number
+	return a + (b - a) * t
+end
+
+function Ease.linear(t: number): number
+	return t
+end
+
+function Ease.inQuad(t: number): number
+	return t * t
+end
+
+function Ease.outQuad(t: number): number
+	return 1 - (1 - t) * (1 - t)
+end
+
+function Ease.inOutQuad(t: number): number
+	return if t < 0.5 then 2 * t * t else 1 - (-2 * t + 2) ^ 2 / 2
+end
+
+function Ease.inCubic(t: number): number
+	return t * t * t
+end
+
+function Ease.outCubic(t: number): number
+	return 1 - (1 - t) ^ 3
+end
+
+function Ease.outQuart(t: number): number
+	return 1 - (1 - t) ^ 4
+end
+
+function Ease.outQuint(t: number): number
+	return 1 - (1 - t) ^ 5
+end
+
+function Ease.inExpo(t: number): number
+	return if t <= 0 then 0 else 2 ^ (10 * t - 10)
+end
+
+function Ease.outExpo(t: number): number
+	return if t >= 1 then 1 else 1 - 2 ^ (-10 * t)
+end
+
+function Ease.inOutSine(t: number): number
+	return -(math.cos(PI * t) - 1) / 2
+end
+
+function Ease.outSine(t: number): number
+	return math.sin(t * HALF_PI)
+end
+
+-- Overshoots then settles: rocks popping out of the ground, UI punches.
+function Ease.outBack(t: number): number
+	local c1 = 1.70158
+	local c3 = c1 + 1
+	return 1 + c3 * (t - 1) ^ 3 + c1 * (t - 1) ^ 2
+end
+
+function Ease.outElastic(t: number): number
+	if t <= 0 then
+		return 0
+	elseif t >= 1 then
+		return 1
+	end
+	return 2 ^ (-10 * t) * math.sin((t * 10 - 0.75) * (2 * PI / 3)) + 1
+end
+
+-- 0 -> 1 -> 0 bell, peak at `peak` (0..1). Handy for flashes and thickness pulses.
+function Ease.pulse(t: number, peak: number): number
+	if t <= 0 or t >= 1 then
+		return 0
+	end
+	if t < peak then
+		return Ease.outQuad(t / peak)
+	end
+	return 1 - Ease.inQuad((t - peak) / (1 - peak))
+end
+
+--[[
+	CSS-style cubic-bezier(x1, y1, x2, y2) easing, so curves can be copied from
+	After Effects / cubic-bezier.com. Solves x(u) = t with Newton + bisection fallback.
+]]
+function Ease.cubicBezier(x1: number, y1: number, x2: number, y2: number): EaseFn
+	local cx = 3 * x1
+	local bx = 3 * (x2 - x1) - cx
+	local ax = 1 - cx - bx
+	local cy = 3 * y1
+	local by = 3 * (y2 - y1) - cy
+	local ay = 1 - cy - by
+
+	local function sampleX(u: number): number
+		return ((ax * u + bx) * u + cx) * u
+	end
+	local function sampleY(u: number): number
+		return ((ay * u + by) * u + cy) * u
+	end
+	local function slopeX(u: number): number
+		return (3 * ax * u + 2 * bx) * u + cx
+	end
+
+	return function(t: number): number
+		if t <= 0 then
+			return 0
+		elseif t >= 1 then
+			return 1
+		end
+		local u = t
+		for _ = 1, 8 do
+			local err = sampleX(u) - t
+			if math.abs(err) < 1e-6 then
+				return sampleY(u)
+			end
+			local d = slopeX(u)
+			if math.abs(d) < 1e-6 then
+				break
+			end
+			u -= err / d
+		end
+		-- Bisection fallback for flat regions.
+		local lo, hi = 0, 1
+		u = t
+		for _ = 1, 30 do
+			local x = sampleX(u)
+			if math.abs(x - t) < 1e-6 then
+				break
+			end
+			if x < t then
+				lo = u
+			else
+				hi = u
+			end
+			u = (lo + hi) / 2
+		end
+		return sampleY(u)
+	end
+end
+
+-- Frame-rate independent exponential smoothing factor: x += (target - x) * Ease.expAlpha(k, dt).
+-- Never overshoots, unlike `x += (target - x) * k * dt` which explodes when k * dt > 1.
+function Ease.expAlpha(sharpness: number, dt: number): number
+	return 1 - math.exp(-sharpness * dt)
+end
+
+return Ease
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="8">
+        <Properties>
+          <string name="Name">Effects</string>
+        </Properties>
+        <Item class="ModuleScript" referent="9">
+          <Properties>
+            <string name="Name">Block</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Block
+	Guarded hit: short white-steel sparks, a small flash, a tiny hitstop and a light
+	camera tap for the defender. params.target = defender.
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local CameraShaker = require(VFX.CameraShaker)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local Block = {} :: Types.Effect
+Block.maxDistance = 220
+
+local STEEL = Color3.fromRGB(225, 232, 245)
+
+function Block.preload()
+	Shapes.preload()
+end
+
+function Block.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+	Shapes.flash(position, STEEL, 1.6, 0.08, 4)
+	Particles.burst(
+		"Sparks",
+		VFXMath.lookAlong(position, -direction) * CFrame.Angles(-math.pi / 2, 0, 0),
+		12 * ctx.quality,
+		{
+			color = STEEL,
+			spread = 60,
+			sizeScale = 0.7,
+		}
+	)
+	if ctx.distance < 90 then
+		Hitstop.apply({ params.source, params.target }, 0.035)
+	end
+	local me = Players.LocalPlayer and Players.LocalPlayer.Character
+	if me and params.target == me then
+		CameraShaker.addTrauma(0.08)
+		CameraShaker.kick(direction, 0.3)
+	end
+end
+
+return Block
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">CraterRocks</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	CraterRocks
+	Ring of rocks bursting out of the ground (+ optional flying debris), the signature
+	"ground slam" read of Deepwoken / JJS style games.
+
+	* Every rock samples the REAL surface under it (raycast): material and color come
+	  from the Terrain material or the BasePart that was hit, so a slam on grass, sand or
+	  a brick floor produces matching debris.
+	* params.seed drives a Random: every client builds the exact same crater.
+	* Rocks are pooled Parts (or clones of "Meshes/Spikes/Rock*" MeshParts if present).
+
+	params.cframe : impact point (client re-aligns to the local ground).
+	params.scale  : ring radius multiplier (1 = 6 studs) and rock size.
+	params.power  : rock count (8 + 4 * power) and debris count.
+]]
+
+local VFX = script.Parent.Parent
+local Animator = require(VFX.Animator)
+local Assets = require(VFX.Assets)
+local Ease = require(VFX.Ease)
+local Pool = require(VFX.Pool)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local CraterRocks = {} :: Types.Effect
+CraterRocks.maxDistance = 300
+
+local BASE_RADIUS = 6
+local RISE_TIME = 0.14
+local HOLD_TIME = 3.2
+local SINK_TIME = 0.8
+local DEBRIS_LIFETIME = 2.4
+
+local rockPool: Pool.Pool<BasePart>? = nil
+local debrisPool: Pool.Pool<BasePart>? = nil
+
+local function rockTemplates(): { BasePart }
+	local list = {}
+	local folder = Assets.find("Meshes/Spikes")
+	if folder then
+		for _, child in folder:GetChildren() do
+			if child:IsA("BasePart") then
+				table.insert(list, child)
+			end
+		end
+	end
+	return list
+end
+
+local function getRockPool(): Pool.Pool<BasePart>
+	local pool = rockPool
+	if pool == nil then
+		local templates = rockTemplates()
+		local counter = 0
+		pool = Pool.new(function(): BasePart
+			local part: BasePart
+			if #templates > 0 then
+				counter += 1
+				part = templates[(counter - 1) % #templates + 1]:Clone()
+			else
+				local block = Instance.new("Part")
+				block.Shape = Enum.PartType.Block
+				block.TopSurface = Enum.SurfaceType.Smooth
+				block.BottomSurface = Enum.SurfaceType.Smooth
+				part = block
+			end
+			part.Name = "CraterRock"
+			Pool.makeVisual(part)
+			part.CFrame = Pool.PARK_CFRAME
+			part.Parent = Assets.workspaceFolder()
+			return part
+		end, {
+			prewarm = 12,
+			onRelease = function(part: BasePart)
+				part.CFrame = Pool.PARK_CFRAME
+			end,
+		})
+		rockPool = pool
+	end
+	return pool :: Pool.Pool<BasePart>
+end
+
+local function getDebrisPool(): Pool.Pool<BasePart>
+	local pool = debrisPool
+	if pool == nil then
+		pool = Pool.new(function(): BasePart
+			local part = Instance.new("Part")
+			part.Name = "CraterDebris"
+			part.TopSurface = Enum.SurfaceType.Smooth
+			part.BottomSurface = Enum.SurfaceType.Smooth
+			part.CanTouch = false
+			part.CanQuery = false
+			part.CastShadow = false
+			part.Anchored = true
+			part.CustomPhysicalProperties = PhysicalProperties.new(0.2, 0.6, 0.2)
+			-- Optional group created by VFXServer so debris never push characters.
+			local PhysicsService = game:GetService("PhysicsService")
+			local ok, registered = pcall(function()
+				return PhysicsService:IsCollisionGroupRegistered("VFXDebris")
+			end)
+			if ok and registered then
+				part.CollisionGroup = "VFXDebris"
+			end
+			part.CFrame = Pool.PARK_CFRAME
+			part.Parent = Assets.workspaceFolder()
+			return part
+		end, {
+			onRelease = function(part: BasePart)
+				part.Anchored = true
+				part.AssemblyLinearVelocity = Vector3.zero
+				part.AssemblyAngularVelocity = Vector3.zero
+				part.Transparency = 0
+				part.CFrame = Pool.PARK_CFRAME
+			end,
+		})
+		debrisPool = pool
+	end
+	return pool :: Pool.Pool<BasePart>
+end
+
+local function spawnRock(result: RaycastResult, radial: Vector3, rng: Random, scale: number)
+	local pool = getRockPool()
+	local rock = pool:acquire()
+	local color, material = Assets.surfaceLook(result)
+	rock.Color = color
+	rock.Material = material
+	rock.Transparency = 0
+
+	local s = scale * VFXMath.randomRange(rng, 1.1, 1.9)
+	local size = Vector3.new(
+		s * VFXMath.randomRange(rng, 0.8, 1.3),
+		s * VFXMath.randomRange(rng, 0.8, 1.35),
+		s * VFXMath.randomRange(rng, 0.8, 1.3)
+	)
+	rock.Size = size
+
+	-- Lean outwards (rotation about the tangent = local X), random roll and yaw.
+	local tilt = math.rad(VFXMath.randomRange(rng, 22, 48))
+	local roll = math.rad(VFXMath.randomRange(rng, -18, 18))
+	local yaw = math.rad(VFXMath.randomRange(rng, -25, 25))
+	local surface = VFXMath.alignToNormal(result.Position, result.Normal, radial)
+	local final = surface * CFrame.Angles(0, yaw, 0) * CFrame.Angles(-tilt, 0, roll) * CFrame.new(0, size.Y * 0.18, 0)
+	local sunk = final * CFrame.new(0, -size.Y * 1.25, 0)
+	rock.CFrame = sunk
+
+	local rise = RISE_TIME * VFXMath.randomRange(rng, 0.8, 1.25)
+	local hold = HOLD_TIME + VFXMath.randomRange(rng, 0, 1)
+	local total = rise + hold + SINK_TIME
+
+	Animator.play(total, function(_t, _dt, elapsed)
+		if elapsed < rise then
+			local k = Ease.outBack(elapsed / rise)
+			Animator.move(rock, sunk:Lerp(final, k))
+		elseif elapsed < rise + hold then
+			Animator.move(rock, final)
+		else
+			local k = Ease.inQuad(math.clamp((elapsed - rise - hold) / SINK_TIME, 0, 1))
+			rock.Size = size * Ease.lerp(1, 0.55, k)
+			Animator.move(rock, final:Lerp(sunk, k))
+		end
+	end, {
+		onComplete = function()
+			pool:release(rock)
+		end,
+	})
+end
+
+local function spawnDebris(
+	origin: Vector3,
+	up: Vector3,
+	color: Color3,
+	material: Enum.Material,
+	rng: Random,
+	scale: number
+)
+	local pool = getDebrisPool()
+	local part = pool:acquire()
+	local s = scale * VFXMath.randomRange(rng, 0.35, 0.75)
+	part.Size = Vector3.new(s, s * VFXMath.randomRange(rng, 0.7, 1.1), s)
+	part.Color = color
+	part.Material = material
+	part.CFrame = CFrame.new(origin + up * (s + 0.2))
+		* CFrame.Angles(rng:NextNumber() * 6.28, rng:NextNumber() * 6.28, rng:NextNumber() * 6.28)
+	part.Anchored = false
+	local direction = VFXMath.randomInCone(rng, up, math.rad(38))
+	part.AssemblyLinearVelocity = direction * VFXMath.randomRange(rng, 38, 62) * math.sqrt(scale)
+	part.AssemblyAngularVelocity = Vector3.new(rng:NextNumber() - 0.5, rng:NextNumber() - 0.5, rng:NextNumber() - 0.5)
+		* 30
+
+	local baseSize = part.Size
+	Animator.play(DEBRIS_LIFETIME, function(t)
+		local k = Ease.inQuad(Ease.phase(t, 0.7, 1))
+		if k > 0 then
+			part.Size = baseSize * (1 - 0.8 * k)
+			part.Transparency = k
+		end
+	end, {
+		group = "debris", -- physics is not time-scaled, so keep fades on real time too
+		onComplete = function()
+			pool:release(part)
+		end,
+	})
+end
+
+function CraterRocks.preload()
+	getRockPool()
+	getDebrisPool()
+end
+
+function CraterRocks.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local rng = ctx.rng
+	local groundParams = Assets.groundParams()
+	local origin = params.cframe.Position
+	local centerHit = workspace:Raycast(origin + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), groundParams)
+	if centerHit == nil then
+		return -- slammed in the air: no crater
+	end
+	local frame = VFXMath.alignToNormal(centerHit.Position, centerHit.Normal, params.cframe.LookVector)
+	local up = frame.UpVector
+	local radius = BASE_RADIUS * params.scale
+	local quality = math.clamp(ctx.quality, 0.25, 1)
+	local count = math.floor((8 + 4 * params.power) * quality + 0.5)
+
+	for _, angle in VFXMath.ringAngles(rng, count, 0.6) do
+		local ringRadius = radius * VFXMath.randomRange(rng, 0.85, 1.15)
+		local point = frame:PointToWorldSpace(VFXMath.arcPoint(ringRadius, angle))
+		local result = workspace:Raycast(point + up * 4, -up * 9, groundParams)
+		if result then
+			local radial = (result.Position - frame.Position)
+			spawnRock(result, if radial.Magnitude > 1e-3 then radial.Unit else frame.LookVector, rng, params.scale)
+		end
+	end
+
+	local debrisCount = math.floor((3 + 2 * params.power) * quality + 0.5)
+	if debrisCount > 0 then
+		local color, material = Assets.surfaceLook(centerHit)
+		for _ = 1, debrisCount do
+			spawnDebris(centerHit.Position, up, color, material, rng, params.scale)
+		end
+	end
+end
+
+return CraterRocks
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="11">
+          <Properties>
+            <string name="Name">FistImpact</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	FistImpact
+	Punch connect: ImpactBurst (sparks, flash, victim highlight, hitstop, camera) plus an
+	air-pressure shock ring facing the punch and, for heavy hits (variant bit 0), a second
+	wide ring and a dust puff. params.cframe LookVector = punch direction.
+]]
+
+local VFX = script.Parent.Parent
+local ImpactBurst = require(script.Parent.ImpactBurst)
+local Particles = require(VFX.Particles)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local FistImpact = {} :: Types.Effect
+FistImpact.maxDistance = 250
+
+local AIR = Color3.fromRGB(245, 245, 255)
+
+function FistImpact.preload()
+	Shapes.preload()
+	if ImpactBurst.preload then
+		ImpactBurst.preload()
+	end
+end
+
+function FistImpact.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local heavy = bit32.band(params.variant, 1) == 1
+	ImpactBurst.play({
+		name = "ImpactBurst",
+		cframe = params.cframe,
+		scale = params.scale,
+		color = params.color or Color3.fromRGB(255, 240, 215),
+		power = params.power * 0.8,
+		variant = params.variant,
+		seed = params.seed,
+		source = params.source,
+		target = params.target,
+	}, ctx)
+	local position = params.cframe.Position
+	local facing = VFXMath.alignToNormal(position, params.cframe.LookVector)
+	Shapes.ring(facing, 0.3, if heavy then 4.2 else 2.6, if heavy then 0.8 else 0.5, AIR, 0.18)
+	if heavy then
+		Shapes.ring(facing * CFrame.new(0, 0.8, 0), 0.5, 6, 0.5, AIR, 0.26, 0.05)
+		Particles.burst("Dust", facing, 6 * ctx.quality, { sizeScale = 0.6, speedScale = 1.2, spread = 40 })
+	end
+end
+
+return FistImpact
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="12">
+          <Properties>
+            <string name="Name">GroundSlam</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	GroundSlam
+	Composite effect: shockwave rings + crater rocks + dust + distance-based camera shake.
+	One network record triggers the whole combo (cheaper and perfectly synchronized).
+
+	params.cframe : impact point, params.scale : size, params.power : 1 (stomp) .. 4 (ultimate)
+]]
+
+local VFX = script.Parent.Parent
+local Assets = require(VFX.Assets)
+local CameraShaker = require(VFX.CameraShaker)
+local CraterRocks = require(script.Parent.CraterRocks)
+local Particles = require(VFX.Particles)
+local ScreenFlash = require(VFX.ScreenFlash)
+local Shockwave = require(script.Parent.Shockwave)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local GroundSlam = {} :: Types.Effect
+GroundSlam.maxDistance = 500
+
+function GroundSlam.preload()
+	if Shockwave.preload then
+		Shockwave.preload()
+	end
+	if CraterRocks.preload then
+		CraterRocks.preload()
+	end
+	Particles.prewarm({ "Dust" }, 2)
+end
+
+function GroundSlam.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	Shockwave.play(params, ctx)
+	CraterRocks.play(params, ctx)
+
+	local origin = params.cframe.Position
+	local hit = workspace:Raycast(origin + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), Assets.groundParams())
+	if hit then
+		local color = Assets.surfaceLook(hit)
+		local frame = VFXMath.alignToNormal(hit.Position, hit.Normal)
+		Particles.burst("Dust", frame, (8 + 6 * params.power) * ctx.quality, {
+			color = color:Lerp(Color3.new(0.85, 0.82, 0.78), 0.35),
+			sizeScale = params.scale,
+			speedScale = 0.8 + 0.25 * params.power,
+			spread = 85,
+		})
+	end
+
+	-- Everybody nearby feels it; the closer, the harder.
+	CameraShaker.addTraumaAt(0.25 + 0.15 * params.power, origin, 40 + 20 * params.power * params.scale)
+	if params.power >= 3 and ctx.distance < 60 then
+		ScreenFlash.impact({ duration = 0.25, brightness = 0.06, contrast = 0.15, blur = 4 })
+	end
+end
+
+return GroundSlam
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="13">
+          <Properties>
+            <string name="Name">GuardBreak</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	GuardBreak
+	Posture shattered: glassy guard shards fly out, a violent ring, big flash, long
+	hitstop, and a desaturated impact punch for the two fighters.
+	params.target = the defender whose guard broke.
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local CameraShaker = require(VFX.CameraShaker)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local ScreenFlash = require(VFX.ScreenFlash)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local GuardBreak = {} :: Types.Effect
+GuardBreak.maxDistance = 320
+
+local SHARD = Color3.fromRGB(170, 215, 255)
+local HOT = Color3.fromRGB(255, 120, 80)
+
+function GuardBreak.preload()
+	Shapes.preload()
+end
+
+function GuardBreak.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+	Shapes.flash(position, Color3.new(1, 1, 1), 4.5, 0.16, 16)
+	Shapes.shards(position, SHARD, math.floor(10 * ctx.quality + 0.5), 28, ctx.rng)
+	Shapes.ring(VFXMath.alignToNormal(position, direction), 0.5, 6, 1, HOT, 0.28)
+	Shapes.ring(VFXMath.alignToNormal(position, Vector3.yAxis), 0.5, 7, 0.6, SHARD, 0.34, 0.04)
+	Particles.burst(
+		"Sparks",
+		VFXMath.alignToNormal(position, Vector3.yAxis),
+		26 * ctx.quality,
+		{ color = HOT, spread = 90 }
+	)
+	if params.target then
+		Shapes.highlight(params.target, HOT, 0.45, "VFX_GuardBreak", 0.2)
+	end
+	if ctx.distance < 100 then
+		Hitstop.apply({ params.source, params.target }, 0.16, { freezeVFX = true })
+	end
+	local me = Players.LocalPlayer and Players.LocalPlayer.Character
+	if me and (params.source == me or params.target == me) then
+		CameraShaker.addTrauma(if params.target == me then 0.5 else 0.25)
+		CameraShaker.kick(direction, 1.2)
+		ScreenFlash.impactFrame(0.05)
+		ScreenFlash.impact({ duration = 0.3, saturation = -0.35, contrast = 0.25, blur = 5 })
+	end
+end
+
+return GuardBreak
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="14">
+          <Properties>
+            <string name="Name">ImpactBurst</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ImpactBurst
+	Weapon hit: sparks + flash sphere + point light + white Highlight flash on the victim,
+	plus the "weight" layer: hitstop on attacker/victim and camera feedback for the two
+	players involved.
+
+	params.cframe : hit point, LookVector = direction the blow travels.
+	params.power  : 0.5 light .. 3 heavy (sparks, flash size, hitstop length, shake).
+	params.source : attacker character (optional)  params.target : victim (optional)
+	params.variant: bit 0 = critical (impact frame + stronger feedback), bit 1 = blocked
+	                (no victim flash, sparks only, short hitstop).
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local Animator = require(VFX.Animator)
+local Assets = require(VFX.Assets)
+local CameraShaker = require(VFX.CameraShaker)
+local Ease = require(VFX.Ease)
+local Fade = require(VFX.Fade)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local Pool = require(VFX.Pool)
+local ScreenFlash = require(VFX.ScreenFlash)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local ImpactBurst = {} :: Types.Effect
+ImpactBurst.maxDistance = 250
+
+local DEFAULT_COLOR = Color3.fromRGB(255, 225, 170)
+local HITSTOP_RADIUS = 90 -- observers farther than this do not freeze animations
+
+local flashPool: Pool.PartPool? = nil
+-- Weak keys: destroyed characters are collected, no leak.
+local activeHighlights: { [Instance]: Highlight } = setmetatable({}, { __mode = "k" }) :: any
+local activeFades: { [Instance]: Animator.Handle } = setmetatable({}, { __mode = "k" }) :: any
+
+local function getFlashPool(): Pool.PartPool
+	local pool = flashPool
+	if pool == nil then
+		local template = Instance.new("Part")
+		template.Name = "ImpactFlash"
+		template.Shape = Enum.PartType.Ball
+		template.Material = Enum.Material.Neon
+		template.Size = Vector3.one
+		local light = Instance.new("PointLight")
+		light.Brightness = 6
+		light.Range = 14
+		light.Shadows = false
+		light.Parent = template
+		pool = Pool.fromTemplate(template, Assets.workspaceFolder(), 6)
+		flashPool = pool
+	end
+	return pool :: Pool.PartPool
+end
+
+local function flashSphere(position: Vector3, color: Color3, size: number)
+	local pool = getFlashPool()
+	local part = pool:acquire()
+	local snapshot = pool.snapshotOf[part]
+	part.Color = color
+	local light = part:FindFirstChildWhichIsA("PointLight")
+	if light then
+		light.Color = color
+	end
+	part.CFrame = CFrame.new(position)
+	Animator.play(0.14, function(t)
+		part.Size = Vector3.one * size * Ease.lerp(0.35, 1, Ease.outExpo(t))
+		Fade.apply(snapshot, 1 - Ease.inQuad(t))
+	end, {
+		onComplete = function()
+			pool:release(part)
+		end,
+	})
+end
+
+-- White body flash on the victim (one Highlight per character, restarted on re-hit).
+local function highlightFlash(target: Instance)
+	if not target:IsA("Model") then
+		return
+	end
+	local highlight: Highlight? = activeHighlights[target]
+	if highlight == nil or highlight.Parent == nil then
+		local created = Instance.new("Highlight")
+		created.Name = "VFX_HitFlash"
+		created.FillColor = Color3.new(1, 1, 1)
+		created.OutlineTransparency = 1
+		created.DepthMode = Enum.HighlightDepthMode.Occluded
+		created.Adornee = target
+		created.Parent = target
+		activeHighlights[target] = created
+		highlight = created
+	end
+	local h = highlight :: Highlight
+	local previous = activeFades[target]
+	if previous then
+		previous:cancel() -- a re-hit restarts the flash instead of fighting the old fade
+	end
+	h.Enabled = true
+	h.FillTransparency = 0.15
+	activeFades[target] = Animator.play(0.18, function(t)
+		h.FillTransparency = Ease.lerp(0.15, 1, Ease.outQuad(t))
+	end, {
+		group = "ui", -- keep flashing through hitstop
+		onComplete = function(cancelled)
+			if not cancelled then
+				h.Enabled = false
+				activeFades[target] = nil
+			end
+		end,
+	})
+end
+
+local function isLocalCharacter(inst: Instance?): boolean
+	local player = Players.LocalPlayer
+	return inst ~= nil and player ~= nil and player.Character == inst
+end
+
+function ImpactBurst.preload()
+	getFlashPool()
+	Particles.prewarm({ "Sparks" }, 4)
+end
+
+function ImpactBurst.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local critical = bit32.band(params.variant, 1) == 1
+	local blocked = bit32.band(params.variant, 2) == 2
+	local power = math.clamp(params.power, 0.25, 5)
+	local color = params.color or DEFAULT_COLOR
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+
+	-- Sparks spray along the blow direction (emitters shoot along UpVector).
+	local sprayFrame = VFXMath.lookAlong(position, direction) * CFrame.Angles(-math.pi / 2, 0, 0)
+	Particles.burst("Sparks", sprayFrame, (10 + 8 * power) * ctx.quality, {
+		color = color,
+		speedScale = 0.8 + 0.2 * power,
+		spread = if blocked then 70 else 45,
+	})
+	flashSphere(position, color, 1.6 + 0.9 * power)
+
+	if not blocked and params.target then
+		highlightFlash(params.target)
+	end
+
+	-- Weight: hitstop for everyone close enough to read it, camera for the two players.
+	if ctx.distance < HITSTOP_RADIUS then
+		local duration = if blocked then 0.035 else 0.045 + 0.02 * power + (if critical then 0.05 else 0)
+		Hitstop.apply({ params.source, params.target }, duration, { freezeVFX = critical })
+	end
+
+	local involvedTarget = ctx.isLocalTarget or isLocalCharacter(params.target)
+	local involvedSource = ctx.isLocalSource or isLocalCharacter(params.source)
+	if involvedTarget then
+		CameraShaker.addTrauma(0.22 + 0.1 * power)
+		CameraShaker.kick(direction, 0.6 + 0.3 * power)
+	elseif involvedSource then
+		CameraShaker.addTrauma(0.08 + 0.05 * power)
+		CameraShaker.fovPunch(-(1.5 + power))
+	end
+	if critical and (involvedTarget or involvedSource) then
+		ScreenFlash.impactFrame(0.05)
+		ScreenFlash.impact({ duration = 0.18, contrast = 0.2, bloom = 1.2, blur = 6 })
+	end
+end
+
+return ImpactBurst
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="15">
+          <Properties>
+            <string name="Name">Parry</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Parry
+	The signature Deepwoken read: a big yellow star spark, a golden ring, a light pop,
+	sparks, and a heavy hitstop on both fighters (world VFX frozen too).
+	params.cframe = contact point (LookVector = blow direction), source = parrier,
+	target = parried attacker.
+]]
+
+local Players = game:GetService("Players")
+
+local VFX = script.Parent.Parent
+local CameraShaker = require(VFX.CameraShaker)
+local Hitstop = require(VFX.Hitstop)
+local Particles = require(VFX.Particles)
+local ScreenFlash = require(VFX.ScreenFlash)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local Parry = {} :: Types.Effect
+Parry.maxDistance = 300
+
+local GOLD = Color3.fromRGB(255, 214, 90)
+local WHITE_HOT = Color3.fromRGB(255, 250, 225)
+
+function Parry.preload()
+	Shapes.preload()
+	Particles.prewarm({ "Sparks" }, 3)
+end
+
+function Parry.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local position = params.cframe.Position
+	local direction = params.cframe.LookVector
+	local power = math.clamp(params.power, 0.5, 3)
+
+	Shapes.flash(position, WHITE_HOT, 3.2 * power, 0.12, 14)
+	Shapes.star(position, GOLD, 5.5 * power, 0.16, ctx.rng)
+	Shapes.ring(VFXMath.alignToNormal(position, direction), 0.3, 4.5 * power, 0.7, GOLD, 0.22)
+	Particles.burst(
+		"Sparks",
+		VFXMath.lookAlong(position, -direction) * CFrame.Angles(-math.pi / 2, 0, 0),
+		30 * ctx.quality,
+		{
+			color = GOLD,
+			speedScale = 1.3,
+			spread = 80,
+		}
+	)
+
+	if ctx.distance < 90 then
+		Hitstop.apply({ params.source, params.target }, 0.12, { freezeVFX = true })
+	end
+	local me = Players.LocalPlayer and Players.LocalPlayer.Character
+	if me and (params.source == me or params.target == me) then
+		CameraShaker.addTrauma(0.22)
+		CameraShaker.fovPunch(-4)
+		ScreenFlash.impact({ duration = 0.14, brightness = 0.08, bloom = 1.4, contrast = 0.15 })
+	end
+end
+
+return Parry
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="16">
+          <Properties>
+            <string name="Name">Shockwave</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Shockwave
+	Expanding ground rings aligned to the real surface under the impact.
+
+	params.cframe : impact point (only the position and the LookVector are used: the
+	                client re-raycasts locally and aligns to the ground normal, so slopes,
+	                stairs and terrain all look right).
+	params.scale  : final radius multiplier (1 = 9 studs).
+	params.power  : number of rings (1 + floor(power), max 4) and thickness.
+
+	Mesh mode: MeshPart "Meshes/Shockwaves/Shockwave" (ring in the XZ plane, Y up).
+	Fallback : expanding BeamArc ring + ForceField disc (zero assets).
+]]
+
+local VFX = script.Parent.Parent
+local Animator = require(VFX.Animator)
+local Assets = require(VFX.Assets)
+local BeamArc = require(VFX.BeamArc)
+local Ease = require(VFX.Ease)
+local Fade = require(VFX.Fade)
+local Pool = require(VFX.Pool)
+local Types = require(VFX.Types)
+local VFXMath = require(VFX.VFXMath)
+
+local Shockwave = {} :: Types.Effect
+Shockwave.maxDistance = 450
+
+local BASE_RADIUS = 9
+local DEFAULT_COLOR = Color3.fromRGB(235, 240, 255)
+local RING_DELAY = 0.07
+
+local meshPool: Pool.PartPool? = nil
+local ringPool: Pool.Pool<BeamArc.BeamArc>? = nil
+local discPool: Pool.PartPool? = nil
+
+local function getMeshPool(): Pool.PartPool?
+	if meshPool then
+		return meshPool
+	end
+	local template = Assets.findPart("Meshes/Shockwaves/Shockwave")
+	if template then
+		meshPool = Pool.fromTemplate(template, Assets.workspaceFolder(), 4)
+	end
+	return meshPool
+end
+
+local function getRingPool(): Pool.Pool<BeamArc.BeamArc>
+	local pool = ringPool
+	if pool == nil then
+		pool = Pool.new(function(): BeamArc.BeamArc
+			return BeamArc.new(Assets.workspaceFolder(), 4, { segmentsPerPiece = 10 })
+		end, {
+			prewarm = 3,
+			onRelease = function(arc: BeamArc.BeamArc)
+				arc:setEnabled(false)
+			end,
+		})
+		ringPool = pool
+	end
+	return pool :: Pool.Pool<BeamArc.BeamArc>
+end
+
+local function getDiscPool(): Pool.PartPool
+	local pool = discPool
+	if pool == nil then
+		local template = Instance.new("Part")
+		template.Name = "ShockwaveDisc"
+		template.Shape = Enum.PartType.Cylinder
+		template.Material = Enum.Material.ForceField
+		template.Size = Vector3.new(0.2, 1, 1)
+		template.Transparency = 0
+		pool = Pool.fromTemplate(template, Assets.workspaceFolder(), 3)
+		discPool = pool
+	end
+	return pool :: Pool.PartPool
+end
+
+-- Re-aligns the effect to the local ground (falls back to the sent orientation).
+local function groundFrame(params: Types.EffectParams): CFrame
+	local origin = params.cframe.Position
+	local result = workspace:Raycast(origin + Vector3.new(0, 3, 0), Vector3.new(0, -10, 0), Assets.groundParams())
+	if result then
+		return VFXMath.alignToNormal(result.Position + result.Normal * 0.06, result.Normal, params.cframe.LookVector)
+	end
+	return params.cframe
+end
+
+local function playMeshRing(
+	pool: Pool.PartPool,
+	frame: CFrame,
+	radius: number,
+	thickness: number,
+	color: Color3?,
+	delay: number,
+	spin: number
+)
+	local part = pool:acquire()
+	local snapshot = pool.snapshotOf[part]
+	if color then
+		part.Color = color
+	end
+	Fade.apply(snapshot, 0)
+	local lifetime = 0.55
+	Animator.play(lifetime, function(t)
+		local d = 2 * radius * Ease.lerp(0.15, 1, Ease.outExpo(t))
+		local h = thickness * Ease.lerp(1.6, 0.12, Ease.outQuad(t))
+		part.Size = Vector3.new(d, h, d)
+		Animator.move(part, frame * CFrame.Angles(0, spin * t, 0))
+		Fade.apply(snapshot, Ease.outQuad(Ease.phase(t, 0, 0.05)) * (1 - Ease.inQuad(Ease.phase(t, 0.25, 1))))
+	end, {
+		delay = delay,
+		onComplete = function()
+			pool:release(part)
+		end,
+	})
+end
+
+local function playBeamRing(frame: CFrame, radius: number, width: number, color: Color3, delay: number)
+	local pool = getRingPool()
+	local ring = pool:acquire()
+	ring:setColor(color)
+	ring:setFrame(frame)
+	ring:set(0.01, 0, 2 * math.pi, function()
+		return 0
+	end, 1)
+	ring:setEnabled(true)
+	local lifetime = 0.5
+	Animator.play(lifetime, function(t)
+		local r = radius * Ease.lerp(0.1, 1, Ease.outExpo(t))
+		local w = width * Ease.lerp(1, 0.15, Ease.outQuad(t))
+		local transparency = Ease.lerp(0.05, 1, Ease.inQuad(Ease.phase(t, 0.2, 1)))
+		ring:set(r, 0, 2 * math.pi, function()
+			return w
+		end, transparency)
+	end, {
+		delay = delay,
+		onComplete = function()
+			pool:release(ring)
+		end,
+	})
+end
+
+local function playDisc(frame: CFrame, radius: number, color: Color3)
+	local pool = getDiscPool()
+	local disc = pool:acquire()
+	local snapshot = pool.snapshotOf[disc]
+	disc.Color = color
+	-- Cylinder axis is the part's X axis: rotate it onto the frame's Y (up).
+	local flat = frame * CFrame.Angles(0, 0, math.pi / 2)
+	Animator.play(0.4, function(t)
+		local d = 2 * radius * Ease.lerp(0.1, 0.9, Ease.outExpo(t))
+		disc.Size = Vector3.new(0.15, d, d)
+		Animator.move(disc, flat)
+		Fade.apply(snapshot, 0.55 * (1 - Ease.outQuad(t)))
+	end, {
+		onComplete = function()
+			pool:release(disc)
+		end,
+	})
+end
+
+function Shockwave.preload()
+	getMeshPool()
+	getRingPool()
+	getDiscPool()
+end
+
+function Shockwave.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local frame = groundFrame(params)
+	local radius = BASE_RADIUS * params.scale
+	local rings = math.clamp(1 + math.floor(params.power), 1, 4)
+	if ctx.quality < 0.5 then
+		rings = math.min(rings, 2)
+	end
+	local color = params.color or DEFAULT_COLOR
+
+	local mesh = getMeshPool()
+	for i = 1, rings do
+		local k = i - 1
+		local ringRadius = radius * (1 - 0.18 * k)
+		local delay = k * RING_DELAY
+		if mesh then
+			local spin = (ctx.rng:NextNumber() - 0.5) * 1.2 -- seeded: identical on every client
+			playMeshRing(mesh, frame, ringRadius, params.scale * (0.6 + 0.2 * params.power), params.color, delay, spin)
+		else
+			playBeamRing(frame, ringRadius, params.scale * (1.1 - 0.2 * k), color, delay)
+		end
+	end
+	if mesh == nil then
+		playDisc(frame, radius, color)
+	end
+end
+
+return Shockwave
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="17">
+          <Properties>
+            <string name="Name">Slash</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Slash
+	Weapon swing crescent.
+
+	params.cframe  : slash frame. UpVector = normal of the swing plane (tilt it for
+	                 diagonal slashes), LookVector = direction the blade travels towards.
+	params.scale   : radius multiplier (1 = 5 studs).
+	params.variant : bit 0 = mirrored sweep (right-to-left), bit 1 = no white core.
+	params.power   : 0.5 (jab) .. 3 (heavy) -> width, lifetime.
+
+	Mesh mode (preferred): MeshPart templates "Meshes/Slashes/Slash" and optional
+	"Meshes/Slashes/SlashCore". Authoring convention: arc in the XZ plane, centered on the
+	origin, bulging towards -Z, template Size = look at scale 1 (see blender_pipeline.md).
+	Beam mode (fallback, zero assets): two BeamArcs (color + white core) that "draw" the
+	crescent (head leads, tail wipes), with a sin-shaped width profile.
+]]
+
+local VFX = script.Parent.Parent
+local Animator = require(VFX.Animator)
+local Assets = require(VFX.Assets)
+local BeamArc = require(VFX.BeamArc)
+local Ease = require(VFX.Ease)
+local Fade = require(VFX.Fade)
+local Pool = require(VFX.Pool)
+local Types = require(VFX.Types)
+
+local Slash = {} :: Types.Effect
+Slash.maxDistance = 350
+
+local DEFAULT_COLOR = Color3.fromRGB(150, 205, 255)
+local CORE_COLOR = Color3.fromRGB(255, 255, 255)
+local BASE_RADIUS = 5
+local SWEEP = math.rad(165)
+
+local meshPools: { [string]: Pool.PartPool } = {}
+local arcPool: Pool.Pool<BeamArc.BeamArc>? = nil
+
+local function meshPool(name: string): Pool.PartPool?
+	local existing = meshPools[name]
+	if existing then
+		return existing
+	end
+	local template = Assets.findPart(`Meshes/Slashes/{name}`)
+	if template == nil then
+		return nil
+	end
+	local pool = Pool.fromTemplate(template, Assets.workspaceFolder(), 4)
+	meshPools[name] = pool
+	return pool
+end
+
+local function getArcPool(): Pool.Pool<BeamArc.BeamArc>
+	local pool = arcPool
+	if pool == nil then
+		pool = Pool.new(function(): BeamArc.BeamArc
+			return BeamArc.new(Assets.workspaceFolder(), 2, { segmentsPerPiece = 16 })
+		end, {
+			prewarm = 4,
+			onRelease = function(arc: BeamArc.BeamArc)
+				arc:setEnabled(false)
+			end,
+		})
+		arcPool = pool
+	end
+	return pool :: Pool.Pool<BeamArc.BeamArc>
+end
+
+-- Mesh layer: squash & stretch + spin + fade on one pooled MeshPart.
+local function playMeshLayer(
+	pool: Pool.PartPool,
+	frame: CFrame,
+	scale: number,
+	color: Color3?,
+	direction: number,
+	lifetime: number,
+	delay: number
+)
+	local part = pool:acquire()
+	local snapshot = pool.snapshotOf[part]
+	local baseSize = pool.template.Size * scale
+	if color then
+		part.Color = color
+	end
+	Fade.apply(snapshot, 0)
+
+	Animator.play(lifetime, function(t)
+		-- Spin: fast launch, soft settle (the arc "travels" through its sweep).
+		local yaw = direction * math.rad(Ease.lerp(-38, 22, Ease.outQuart(t)))
+		-- Width grows with an exponential snap; thickness pops then thins while dissolving.
+		local grow = Ease.lerp(0.72, 1.12, Ease.outExpo(t))
+		local thickness = Ease.lerp(0.12, 1, Ease.outExpo(Ease.phase(t, 0, 0.14)))
+			* Ease.lerp(1, 0.3, Ease.inQuad(Ease.phase(t, 0.35, 1)))
+		part.Size = Vector3.new(baseSize.X * grow, baseSize.Y * thickness, baseSize.Z * grow)
+		Animator.move(part, frame * CFrame.Angles(0, yaw, 0))
+
+		local fadeIn = Ease.outQuad(Ease.phase(t, 0, 0.06))
+		local fadeOut = 1 - Ease.inQuad(Ease.phase(t, 0.4, 1))
+		Fade.apply(snapshot, fadeIn * fadeOut)
+	end, {
+		delay = delay,
+		onComplete = function()
+			pool:release(part)
+		end,
+	})
+end
+
+-- Beam layer: the crescent is drawn head-first, then wiped from the tail.
+local function playArcLayer(
+	frame: CFrame,
+	radius: number,
+	width: number,
+	color: Color3,
+	direction: number,
+	lifetime: number,
+	zOffset: number
+)
+	local pool = getArcPool()
+	local arc = pool:acquire()
+	arc:setColor(color)
+	for _, beam in arc.beams do
+		beam.ZOffset = zOffset
+	end
+	arc:setFrame(frame)
+	arc:setEnabled(true)
+
+	local half = SWEEP / 2
+	Animator.play(lifetime, function(t)
+		local head = -half + SWEEP * Ease.outExpo(Ease.phase(t, 0, 0.32))
+		local tail = -half + SWEEP * Ease.inQuad(Ease.phase(t, 0.12, 1))
+		local r = radius * Ease.lerp(0.92, 1.06, Ease.outQuad(t))
+		local w = width * Ease.lerp(1, 0.45, Ease.inQuad(Ease.phase(t, 0.3, 1)))
+		local transparency = Ease.lerp(0.02, 1, Ease.inQuad(Ease.phase(t, 0.45, 1)))
+		if head - tail < 1e-3 then
+			arc:set(r, tail, tail + 1e-3, function()
+				return 0
+			end, 1)
+			return
+		end
+		arc:set(r, tail * direction, head * direction, function(u)
+			return w * math.sin(math.pi * u) ^ 0.75
+		end, transparency)
+	end, {
+		onComplete = function()
+			pool:release(arc)
+		end,
+	})
+end
+
+function Slash.preload()
+	meshPool("Slash")
+	meshPool("SlashCore")
+	getArcPool()
+end
+
+function Slash.play(params: Types.EffectParams, ctx: Types.EffectContext)
+	local direction = if bit32.band(params.variant, 1) == 1 then -1 else 1
+	local withCore = bit32.band(params.variant, 2) == 0
+	local power = math.clamp(params.power, 0.25, 5)
+	local lifetime = 0.26 + 0.05 * power
+	local color = params.color or DEFAULT_COLOR
+
+	local main = meshPool("Slash")
+	if main then
+		playMeshLayer(main, params.cframe, params.scale, params.color, direction, lifetime, 0)
+		local core = if withCore then meshPool("SlashCore") else nil
+		if core then
+			playMeshLayer(core, params.cframe, params.scale * 0.94, CORE_COLOR, direction, lifetime * 0.85, 0.015)
+		end
+		return
+	end
+
+	-- Zero-asset fallback.
+	local radius = BASE_RADIUS * params.scale
+	local width = (0.9 + 0.35 * power) * params.scale
+	playArcLayer(params.cframe, radius, width, color, direction, lifetime, 0)
+	if withCore and ctx.quality > 0.3 then
+		playArcLayer(params.cframe, radius * 0.985, width * 0.42, CORE_COLOR, direction, lifetime * 0.85, 0.15)
+	end
+end
+
+return Slash
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="18">
+          <Properties>
+            <string name="Name">Telegraph</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Telegraph
+	Perilous-attack warning (Deepwoken's red flash): the attacker's body flashes red twice
+	and a red flare pops at the chest. Played when an unparryable move starts; the
+	windup is the reaction time to DODGE. params.source = attacker.
+]]
+
+local VFX = script.Parent.Parent
+local Animator = require(VFX.Animator)
+local Shapes = require(VFX.Shapes)
+local Types = require(VFX.Types)
+
+local Telegraph = {} :: Types.Effect
+Telegraph.maxDistance = 350
+
+local RED = Color3.fromRGB(255, 40, 40)
+
+function Telegraph.preload()
+	Shapes.preload()
+end
+
+function Telegraph.play(params: Types.EffectParams, _ctx: Types.EffectContext)
+	local source = params.source
+	local chest = params.cframe.Position + Vector3.new(0, 0.8, 0)
+	if source and source:IsA("Model") then
+		local root = source:FindFirstChild("HumanoidRootPart")
+		if root and root:IsA("BasePart") then
+			chest = root.Position + Vector3.new(0, 0.8, 0)
+		end
+		Shapes.highlight(source, RED, 0.22, "VFX_Telegraph", 0.05)
+		Animator.delay(0.24, function()
+			Shapes.highlight(source, RED, 0.3, "VFX_Telegraph", 0.25)
+		end, "ui")
+	end
+	Shapes.flash(chest, RED, 2.2, 0.2, 10)
+end
+
+return Telegraph
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="19">
+        <Properties>
+          <string name="Name">Fade</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Fade
+	Fades a whole effect (part + every Decal / Texture / Beam / Trail / ParticleEmitter /
+	Light / Highlight below it) with ONE opacity value, preserving each child's authored
+	transparency.
+
+	The classic bug this fixes: tweening `MeshPart.Transparency` does NOT fade the
+	Decals/Textures on it, so the glow texture "pops" out at the end of the effect.
+
+	Usage:
+		local snapshot = Fade.capture(effectModel)  -- once (e.g. when pooling)
+		Fade.apply(snapshot, 0.5)                   -- 50% of authored opacity
+		Fade.restore(snapshot)                      -- back to authored values
+]]
+
+type PartEntry = { kind: "part", inst: BasePart, base: number }
+type DecalEntry = { kind: "decal", inst: Decal, base: number }
+type BeamEntry = { kind: "beam", inst: Beam, base: { NumberSequenceKeypoint } }
+type TrailEntry = { kind: "trail", inst: Trail, base: { NumberSequenceKeypoint } }
+type ParticleEntry = { kind: "particle", inst: ParticleEmitter, base: { NumberSequenceKeypoint } }
+type LightEntry = { kind: "light", inst: Light, base: number }
+type HighlightEntry = { kind: "highlight", inst: Highlight, fill: number, outline: number }
+
+type Entry = PartEntry | DecalEntry | BeamEntry | TrailEntry | ParticleEntry | LightEntry | HighlightEntry
+
+export type Snapshot = {
+	entries: { Entry },
+	opacity: number,
+}
+
+local Fade = {}
+
+local function scaleSequence(base: { NumberSequenceKeypoint }, opacity: number): NumberSequence
+	local keypoints = table.create(#base)
+	for i, kp in base do
+		keypoints[i] = NumberSequenceKeypoint.new(kp.Time, 1 - (1 - kp.Value) * opacity, kp.Envelope * opacity)
+	end
+	return NumberSequence.new(keypoints)
+end
+
+local function captureOne(inst: Instance, entries: { Entry })
+	if inst:IsA("BasePart") then
+		table.insert(entries, { kind = "part", inst = inst, base = inst.Transparency })
+	elseif inst:IsA("Decal") then -- also matches Texture (Texture extends Decal)
+		table.insert(entries, { kind = "decal", inst = inst, base = inst.Transparency })
+	elseif inst:IsA("Beam") then
+		table.insert(entries, { kind = "beam", inst = inst, base = inst.Transparency.Keypoints })
+	elseif inst:IsA("Trail") then
+		table.insert(entries, { kind = "trail", inst = inst, base = inst.Transparency.Keypoints })
+	elseif inst:IsA("ParticleEmitter") then
+		table.insert(entries, { kind = "particle", inst = inst, base = inst.Transparency.Keypoints })
+	elseif inst:IsA("Light") then
+		table.insert(entries, { kind = "light", inst = inst, base = inst.Brightness })
+	elseif inst:IsA("Highlight") then
+		table.insert(
+			entries,
+			{ kind = "highlight", inst = inst, fill = inst.FillTransparency, outline = inst.OutlineTransparency }
+		)
+	end
+end
+
+function Fade.capture(root: Instance): Snapshot
+	local entries: { Entry } = {}
+	captureOne(root, entries)
+	for _, descendant in root:GetDescendants() do
+		captureOne(descendant, entries)
+	end
+	return { entries = entries, opacity = 1 }
+end
+
+-- opacity: 1 = authored look, 0 = fully invisible. Values above 1 are clamped.
+-- (Branches look identical but each one is a different typed Instance kind.)
+-- selene: allow(if_same_then_else)
+function Fade.apply(snapshot: Snapshot, opacity: number)
+	opacity = math.clamp(opacity, 0, 1)
+	if math.abs(opacity - snapshot.opacity) < 1e-3 then
+		return -- NumberSequence rebuilds are not free; skip no-op frames.
+	end
+	snapshot.opacity = opacity
+	for _, entry in snapshot.entries do
+		if entry.kind == "part" then
+			entry.inst.Transparency = 1 - (1 - entry.base) * opacity
+		elseif entry.kind == "decal" then
+			entry.inst.Transparency = 1 - (1 - entry.base) * opacity
+		elseif entry.kind == "beam" then
+			entry.inst.Transparency = scaleSequence(entry.base, opacity)
+		elseif entry.kind == "trail" then
+			entry.inst.Transparency = scaleSequence(entry.base, opacity)
+		elseif entry.kind == "particle" then
+			entry.inst.Transparency = scaleSequence(entry.base, opacity)
+		elseif entry.kind == "light" then
+			entry.inst.Brightness = entry.base * opacity
+		elseif entry.kind == "highlight" then
+			entry.inst.FillTransparency = 1 - (1 - entry.fill) * opacity
+			entry.inst.OutlineTransparency = 1 - (1 - entry.outline) * opacity
+		end
+	end
+end
+
+function Fade.restore(snapshot: Snapshot)
+	snapshot.opacity = -1 -- force a full write
+	Fade.apply(snapshot, 1)
+end
+
+return Fade
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="20">
+        <Properties>
+          <string name="Name">Hitstop</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Hitstop
+	Fighting-game frame freeze: every animation playing on the attacker and the victim
+	stops for a few frames on impact (and, optionally, every "world" VFX too).
+
+	Fixes over the naive `track:AdjustSpeed(0); task.delay(d, AdjustSpeed(1))`:
+	  * freezes ALL playing tracks (idle + attack + walk layers), not one track;
+	  * restores each track's ORIGINAL speed (a 1.3x attack stays 1.3x);
+	  * overlapping hitstops extend the freeze instead of un-freezing early;
+	  * restores happen in RunService.PreAnimation, the documented place to change
+	    AnimationTrack speed before the Animator steps.
+
+	Typical durations: light M1 0.04-0.06 s, heavy / crit 0.08-0.12 s, parry 0.12-0.16 s.
+
+	Usage:
+		Hitstop.apply({ attackerCharacter, victimCharacter }, 0.07)
+		Hitstop.apply({ attackerCharacter }, 0.1, { speed = 0.05, freezeVFX = true })
+]]
+
+local RunService = game:GetService("RunService")
+
+local Animator = require(script.Parent.Animator)
+
+export type Options = {
+	speed: number?, -- playback speed during the freeze (0 = full stop, 0.05 = heavy slow-mo)
+	freezeVFX: boolean?, -- also freeze Animator group "world" (slashes stop mid-swing)
+}
+
+type Frozen = {
+	originalSpeed: number,
+	releaseAt: number,
+}
+
+local Hitstop = {}
+
+local frozen: { [AnimationTrack]: Frozen } = {}
+local vfxReleaseAt = 0
+local connection: RBXScriptConnection? = nil
+
+local function findAnimator(target: Instance): Animator?
+	if target:IsA("Animator") then
+		return target
+	end
+	local controller: Instance? = target:FindFirstChildWhichIsA("Humanoid")
+		or target:FindFirstChildWhichIsA("AnimationController")
+	if controller == nil and (target:IsA("Humanoid") or target:IsA("AnimationController")) then
+		controller = target
+	end
+	return if controller then controller:FindFirstChildWhichIsA("Animator") else nil
+end
+
+local function onPreAnimation()
+	local now = os.clock()
+	for track, state in frozen do
+		if now >= state.releaseAt then
+			frozen[track] = nil
+			if track.IsPlaying then
+				track:AdjustSpeed(state.originalSpeed)
+			end
+		end
+	end
+	if vfxReleaseAt > 0 and now >= vfxReleaseAt then
+		vfxReleaseAt = 0
+		Animator.setTimeScale("world", 1)
+	end
+	if next(frozen) == nil and vfxReleaseAt == 0 and connection then
+		connection:Disconnect()
+		connection = nil
+	end
+end
+
+function Hitstop.apply(targets: { Instance? }, duration: number, options: Options?)
+	if duration <= 0 then
+		return
+	end
+	local speed = if options and options.speed then options.speed else 0
+	local releaseAt = os.clock() + duration
+
+	for _, target in targets do
+		local animator = target and findAnimator(target)
+		if animator == nil then
+			continue
+		end
+		for _, track in animator:GetPlayingAnimationTracks() do
+			local state = frozen[track]
+			if state then
+				state.releaseAt = math.max(state.releaseAt, releaseAt)
+			else
+				frozen[track] = { originalSpeed = track.Speed, releaseAt = releaseAt }
+				track:AdjustSpeed(speed)
+			end
+		end
+	end
+
+	if options and options.freezeVFX then
+		vfxReleaseAt = math.max(vfxReleaseAt, releaseAt)
+		Animator.setTimeScale("world", speed)
+	end
+
+	if connection == nil then
+		connection = RunService.PreAnimation:Connect(onPreAnimation)
+	end
+end
+
+-- Immediately releases everything (e.g. on character death / round end).
+function Hitstop.releaseAll()
+	for track, state in frozen do
+		if track.IsPlaying then
+			track:AdjustSpeed(state.originalSpeed)
+		end
+	end
+	table.clear(frozen)
+	if vfxReleaseAt > 0 then
+		vfxReleaseAt = 0
+		Animator.setTimeScale("world", 1)
+	end
+end
+
+function Hitstop.isFrozen(track: AnimationTrack): boolean
+	return frozen[track] ~= nil
+end
+
+return Hitstop
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="21">
+        <Properties>
+          <string name="Name">Net</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Net
+	Compact binary encoding of effect events with the `buffer` library.
+
+	One record = 31 bytes:
+	  u8  effect id        u16 seed           f32 x3 position
+	  i16 x3 rotation (YXZ euler, ~0.0001 rad precision)
+	  u16 scale * 100      u8 x3 color        u8 flags (bit0 = has color)
+	  u8  power * 50       u8 variant         u8 source index  u8 target index
+
+	A packet = u8 count + N records. UnreliableRemoteEvent payloads above ~900 bytes are
+	dropped, so a packet holds at most 28 records (869 bytes). Instances (source/target
+	characters) travel in a separate array argument and are referenced by 1-based index
+	(0 = none).
+
+	Pure Luau (buffer + CFrame only): round-trip tested under Lune.
+]]
+
+local Net = {}
+
+Net.RECORD_SIZE = 31
+Net.MAX_RECORDS = 28
+Net.MAX_PAYLOAD = 1 + Net.RECORD_SIZE * Net.MAX_RECORDS
+
+export type Record = {
+	id: number,
+	seed: number,
+	cframe: CFrame,
+	scale: number,
+	color: Color3?,
+	power: number,
+	variant: number,
+	sourceIndex: number,
+	targetIndex: number,
+}
+
+local ANGLE_SCALE = 32767 / math.pi
+
+local function quantizeAngle(angle: number): number
+	return math.clamp(math.round(angle * ANGLE_SCALE), -32767, 32767)
+end
+
+local function toByte(value: number): number
+	return math.clamp(math.round(value), 0, 255)
+end
+
+function Net.writeRecord(b: buffer, offset: number, record: Record)
+	local cf = record.cframe
+	local rx, ry, rz = cf:ToEulerAnglesYXZ()
+	local p = cf.Position
+
+	buffer.writeu8(b, offset, record.id)
+	buffer.writeu16(b, offset + 1, math.clamp(math.floor(record.seed), 0, 65535))
+	buffer.writef32(b, offset + 3, p.X)
+	buffer.writef32(b, offset + 7, p.Y)
+	buffer.writef32(b, offset + 11, p.Z)
+	buffer.writei16(b, offset + 15, quantizeAngle(rx))
+	buffer.writei16(b, offset + 17, quantizeAngle(ry))
+	buffer.writei16(b, offset + 19, quantizeAngle(rz))
+	buffer.writeu16(b, offset + 21, math.clamp(math.round(record.scale * 100), 0, 65535))
+
+	local color = record.color
+	if color then
+		buffer.writeu8(b, offset + 23, toByte(color.R * 255))
+		buffer.writeu8(b, offset + 24, toByte(color.G * 255))
+		buffer.writeu8(b, offset + 25, toByte(color.B * 255))
+		buffer.writeu8(b, offset + 26, 1)
+	else
+		buffer.writeu8(b, offset + 23, 0)
+		buffer.writeu8(b, offset + 24, 0)
+		buffer.writeu8(b, offset + 25, 0)
+		buffer.writeu8(b, offset + 26, 0)
+	end
+
+	buffer.writeu8(b, offset + 27, toByte(record.power * 50))
+	buffer.writeu8(b, offset + 28, toByte(record.variant))
+	buffer.writeu8(b, offset + 29, toByte(record.sourceIndex))
+	buffer.writeu8(b, offset + 30, toByte(record.targetIndex))
+end
+
+function Net.readRecord(b: buffer, offset: number): Record
+	local position =
+		Vector3.new(buffer.readf32(b, offset + 3), buffer.readf32(b, offset + 7), buffer.readf32(b, offset + 11))
+	local rx = buffer.readi16(b, offset + 15) / ANGLE_SCALE
+	local ry = buffer.readi16(b, offset + 17) / ANGLE_SCALE
+	local rz = buffer.readi16(b, offset + 19) / ANGLE_SCALE
+
+	local color: Color3? = nil
+	if bit32.band(buffer.readu8(b, offset + 26), 1) == 1 then
+		color =
+			Color3.fromRGB(buffer.readu8(b, offset + 23), buffer.readu8(b, offset + 24), buffer.readu8(b, offset + 25))
+	end
+
+	return {
+		id = buffer.readu8(b, offset),
+		seed = buffer.readu16(b, offset + 1),
+		cframe = CFrame.new(position) * CFrame.fromEulerAnglesYXZ(rx, ry, rz),
+		scale = buffer.readu16(b, offset + 21) / 100,
+		color = color,
+		power = buffer.readu8(b, offset + 27) / 50,
+		variant = buffer.readu8(b, offset + 28),
+		sourceIndex = buffer.readu8(b, offset + 29),
+		targetIndex = buffer.readu8(b, offset + 30),
+	}
+end
+
+-- Encodes up to MAX_RECORDS records (callers chunk bigger batches with Net.chunk).
+function Net.encode(records: { Record }): buffer
+	local count = #records
+	assert(count <= Net.MAX_RECORDS, "too many records for one packet; use Net.chunk")
+	local b = buffer.create(1 + count * Net.RECORD_SIZE)
+	buffer.writeu8(b, 0, count)
+	for i, record in records do
+		Net.writeRecord(b, 1 + (i - 1) * Net.RECORD_SIZE, record)
+	end
+	return b
+end
+
+-- Decodes a packet. Returns nil for malformed input (never trust the network).
+function Net.decode(b: any): { Record }?
+	if typeof(b) ~= "buffer" then
+		return nil
+	end
+	local length = buffer.len(b)
+	if length < 1 then
+		return nil
+	end
+	local count = buffer.readu8(b, 0)
+	if count > Net.MAX_RECORDS or length ~= 1 + count * Net.RECORD_SIZE then
+		return nil
+	end
+	local records = table.create(count)
+	for i = 1, count do
+		records[i] = Net.readRecord(b, 1 + (i - 1) * Net.RECORD_SIZE)
+	end
+	return records
+end
+
+-- Splits a record list into packet-sized lists.
+function Net.chunk(records: { Record }): { { Record } }
+	local chunks = {}
+	for start = 1, #records, Net.MAX_RECORDS do
+		table.insert(chunks, table.move(records, start, math.min(start + Net.MAX_RECORDS - 1, #records), 1, {}))
+	end
+	return chunks
+end
+
+return Net
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="22">
+        <Properties>
+          <string name="Name">Particles</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Particles
+	Pooled one-shot particle bursts (sparks, dust, embers) using ParticleEmitter:Emit().
+
+	* Designers can override any kind with a ParticleEmitter named like the kind in
+	  ReplicatedStorage.Assets.VFX.Particles (e.g. "Sparks"). Otherwise a procedural
+	  emitter using built-in engine textures is used, so it works with zero assets.
+	* Emitters are pooled per kind. A holder is NOT shared between simultaneous bursts:
+	  Color/Size sequences are evaluated live for every particle, so recoloring a shared
+	  emitter would recolor particles that are already flying.
+
+	Usage:
+		Particles.burst("Sparks", VFXMath.alignToNormal(hitPos, hitNormal), 18, { color = Color3.new(1, .8, .4) })
+]]
+
+local Assets = require(script.Parent.Assets)
+local Pool = require(script.Parent.Pool)
+
+export type Kind = "Sparks" | "Dust" | "Embers"
+
+export type BurstOptions = {
+	color: Color3?,
+	sizeScale: number?,
+	speedScale: number?,
+	spread: number?, -- degrees, overrides SpreadAngle (both axes)
+}
+
+type Holder = {
+	part: BasePart,
+	attachment: Attachment,
+	emitter: ParticleEmitter,
+	baseSize: { NumberSequenceKeypoint },
+	baseSpeed: NumberRange,
+	baseColor: ColorSequence,
+	baseSpread: Vector2,
+	maxLifetime: number,
+}
+
+local Particles = {}
+
+local BUILTIN_SPARK = "rbxasset://textures/particles/sparkles_main.dds"
+local BUILTIN_SMOKE = "rbxasset://textures/particles/smoke_main.dds"
+
+local function proceduralEmitter(kind: Kind): ParticleEmitter
+	local e = Instance.new("ParticleEmitter")
+	e.Enabled = false
+	e.LockedToPart = false
+	e.EmissionDirection = Enum.NormalId.Top
+	if kind == "Sparks" then
+		e.Texture = BUILTIN_SPARK
+		e.LightEmission = 1
+		e.LightInfluence = 0
+		e.Brightness = 3
+		e.Lifetime = NumberRange.new(0.15, 0.35)
+		e.Speed = NumberRange.new(28, 48)
+		e.SpreadAngle = Vector2.new(55, 55)
+		e.Drag = 6
+		e.Acceleration = Vector3.new(0, -45, 0)
+		e.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.45),
+			NumberSequenceKeypoint.new(1, 0),
+		})
+		e.Squash = NumberSequence.new(1.2)
+		e.Orientation = Enum.ParticleOrientation.VelocityParallel
+		e.Color = ColorSequence.new(Color3.fromRGB(255, 220, 160))
+	elseif kind == "Dust" then
+		e.Texture = BUILTIN_SMOKE
+		e.LightEmission = 0
+		e.LightInfluence = 1
+		e.Lifetime = NumberRange.new(0.8, 1.4)
+		e.Speed = NumberRange.new(8, 16)
+		e.SpreadAngle = Vector2.new(80, 80)
+		e.Drag = 4
+		e.Acceleration = Vector3.new(0, 3, 0)
+		e.Rotation = NumberRange.new(0, 360)
+		e.RotSpeed = NumberRange.new(-40, 40)
+		e.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1.5),
+			NumberSequenceKeypoint.new(1, 5.5),
+		})
+		e.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.35),
+			NumberSequenceKeypoint.new(1, 1),
+		})
+		e.Color = ColorSequence.new(Color3.fromRGB(150, 140, 125))
+	else -- Embers
+		e.Texture = BUILTIN_SPARK
+		e.LightEmission = 1
+		e.LightInfluence = 0
+		e.Brightness = 2
+		e.Lifetime = NumberRange.new(0.6, 1.2)
+		e.Speed = NumberRange.new(8, 18)
+		e.SpreadAngle = Vector2.new(70, 70)
+		e.Drag = 2
+		e.Acceleration = Vector3.new(0, 8, 0)
+		e.Size = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 0.25),
+			NumberSequenceKeypoint.new(1, 0),
+		})
+		e.Color = ColorSequence.new(Color3.fromRGB(255, 170, 90))
+	end
+	return e
+end
+
+local pools: { [Kind]: Pool.Pool<Holder> } = {}
+
+local function makeHolder(kind: Kind): Holder
+	local part = Instance.new("Part")
+	part.Name = `Particles_{kind}`
+	part.Transparency = 1
+	part.Size = Vector3.new(0.2, 0.2, 0.2)
+	Pool.makeVisual(part)
+	part.CFrame = Pool.PARK_CFRAME
+
+	local attachment = Instance.new("Attachment")
+	attachment.Parent = part
+
+	local template = Assets.find(`Particles/{kind}`)
+	local emitter: ParticleEmitter = if template and template:IsA("ParticleEmitter")
+		then template:Clone()
+		else proceduralEmitter(kind)
+	emitter.Enabled = false
+	emitter.Parent = attachment
+	part.Parent = Assets.workspaceFolder()
+
+	return {
+		part = part,
+		attachment = attachment,
+		emitter = emitter,
+		baseSize = emitter.Size.Keypoints,
+		baseSpeed = emitter.Speed,
+		baseColor = emitter.Color,
+		baseSpread = emitter.SpreadAngle,
+		maxLifetime = emitter.Lifetime.Max,
+	}
+end
+
+local function poolFor(kind: Kind): Pool.Pool<Holder>
+	local pool = pools[kind]
+	if pool == nil then
+		pool = Pool.new(function(): Holder
+			return makeHolder(kind)
+		end, {
+			onRelease = function(holder: Holder)
+				holder.part.CFrame = Pool.PARK_CFRAME
+			end,
+		})
+		pools[kind] = pool
+	end
+	return pool :: Pool.Pool<Holder>
+end
+
+-- Emits `count` particles from `cframe` (particles leave along cframe.UpVector).
+function Particles.burst(kind: Kind, cframe: CFrame, count: number, options: BurstOptions?)
+	local n = math.floor(count + 0.5)
+	if n <= 0 then
+		return
+	end
+	local pool = poolFor(kind)
+	local holder = pool:acquire()
+	local emitter = holder.emitter
+
+	local sizeScale = if options and options.sizeScale then options.sizeScale else 1
+	local speedScale = if options and options.speedScale then options.speedScale else 1
+
+	local keypoints = table.create(#holder.baseSize)
+	for i, kp in holder.baseSize do
+		keypoints[i] = NumberSequenceKeypoint.new(kp.Time, kp.Value * sizeScale, kp.Envelope * sizeScale)
+	end
+	emitter.Size = NumberSequence.new(keypoints)
+	emitter.Speed = NumberRange.new(holder.baseSpeed.Min * speedScale, holder.baseSpeed.Max * speedScale)
+	emitter.Color = if options and options.color then ColorSequence.new(options.color) else holder.baseColor
+	emitter.SpreadAngle = if options and options.spread
+		then Vector2.new(options.spread, options.spread)
+		else holder.baseSpread
+
+	-- Must be a direct write (not Animator.move): Emit() samples the position right now.
+	holder.part.CFrame = cframe
+	emitter:Emit(n)
+
+	-- Real time on purpose (not time-scaled): particles themselves ignore hitstop.
+	task.delay(holder.maxLifetime + 0.1, function()
+		pool:release(holder)
+	end)
+end
+
+-- Builds the pools ahead of time so the first burst does not allocate.
+function Particles.prewarm(kinds: { Kind }, perKind: number)
+	for _, kind in kinds do
+		local pool = poolFor(kind :: Kind)
+		local held = {}
+		for i = 1, perKind do
+			held[i] = pool:acquire()
+		end
+		for _, holder in held do
+			pool:release(holder)
+		end
+	end
+end
+
+return Particles
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="23">
+        <Properties>
+          <string name="Name">Pool</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Pool
+	Object pooling for effect instances. Creating/destroying Instances every hit causes
+	GC spikes and replication-free but still costly parenting work; reusing them does not.
+
+	Parked objects stay parented (re-parenting is the expensive part) and are moved far
+	away + fully transparent, which is the approach used by PartCache-style libraries.
+
+	Usage (generic):
+		local pool = Pool.new(function() return makeHolder() end, {
+			onRelease = function(holder) holder.Beam.Enabled = false end,
+			prewarm = 8,
+		})
+		local holder = pool:acquire()
+		pool:release(holder)
+
+	Usage (template BasePart / MeshPart):
+		local pool = Pool.fromTemplate(template, folder, 6)
+		local part, snapshot = pool:acquire(), pool.snapshotOf[part]
+]]
+
+local Fade = require(script.Parent.Fade)
+
+export type Hooks<T> = {
+	onAcquire: ((T) -> ())?,
+	onRelease: ((T) -> ())?,
+	onDestroy: ((T) -> ())?, -- called when an item beyond `max` is discarded
+	prewarm: number?,
+	max: number?, -- objects beyond this count are destroyed on release instead of kept
+}
+
+export type Pool<T> = {
+	acquire: (self: Pool<T>) -> T,
+	release: (self: Pool<T>, item: T) -> (),
+	size: (self: Pool<T>) -> (number, number),
+}
+
+export type PartPool = Pool<BasePart> & {
+	snapshotOf: { [BasePart]: Fade.Snapshot },
+	template: BasePart,
+}
+
+local Pool = {}
+
+-- Far below the map, where anchored parts are never rendered nor queried.
+Pool.PARK_CFRAME = CFrame.new(0, -5e4, 0)
+
+function Pool.new<T>(factory: () -> T, hooks: Hooks<T>?): Pool<T>
+	local free: { T } = {}
+	local inUse: { [T]: boolean } = {}
+	local total = 0
+	local max = if hooks and hooks.max then hooks.max else math.huge
+	local onAcquire = hooks and hooks.onAcquire
+	local onRelease = hooks and hooks.onRelease
+	local onDestroy = hooks and hooks.onDestroy
+
+	local pool = {} :: Pool<T>
+
+	function pool.acquire(_self: Pool<T>): T
+		local item = table.remove(free)
+		if item == nil then
+			item = factory()
+			total += 1
+		end
+		assert(item ~= nil, "pool factory returned nil")
+		inUse[item] = true
+		if onAcquire then
+			onAcquire(item)
+		end
+		return item
+	end
+
+	function pool.release(_self: Pool<T>, item: T)
+		if not inUse[item] then
+			return -- double release guard
+		end
+		inUse[item] = nil
+		if onRelease then
+			onRelease(item)
+		end
+		if #free + 1 > max then
+			total -= 1
+			if onDestroy then
+				onDestroy(item)
+			end
+			if typeof(item) == "Instance" then
+				(item :: any):Destroy()
+			end
+			return
+		end
+		table.insert(free, item)
+	end
+
+	function pool.size(_self: Pool<T>): (number, number)
+		return total, #free
+	end
+
+	local prewarm = if hooks and hooks.prewarm then hooks.prewarm else 0
+	for _ = 1, prewarm do
+		local item = factory()
+		total += 1
+		if onRelease then
+			onRelease(item)
+		end
+		table.insert(free, item)
+	end
+
+	return pool
+end
+
+-- Makes a clone safe to use as a pure visual (no physics, no queries, no shadows).
+function Pool.makeVisual(part: BasePart)
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanTouch = false
+	part.CanQuery = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Locked = true
+	for _, d in part:GetDescendants() do
+		if d:IsA("BasePart") then
+			d.Anchored = true
+			d.CanCollide = false
+			d.CanTouch = false
+			d.CanQuery = false
+			d.CastShadow = false
+		end
+	end
+end
+
+-- Pool of clones of a BasePart/MeshPart template (its Decals, Textures, Beams... included).
+function Pool.fromTemplate(template: BasePart, parent: Instance, prewarm: number?, max: number?): PartPool
+	local snapshotOf: { [BasePart]: Fade.Snapshot } = {}
+	local templateSize = template.Size
+	local templateColor = template.Color
+
+	local base = Pool.new(function(): BasePart
+		local part = template:Clone()
+		Pool.makeVisual(part)
+		part.CFrame = Pool.PARK_CFRAME
+		part.Parent = parent
+		snapshotOf[part] = Fade.capture(part)
+		return part
+	end, {
+		prewarm = prewarm,
+		max = max,
+		onRelease = function(part: BasePart)
+			local snapshot = snapshotOf[part]
+			if snapshot then
+				Fade.restore(snapshot)
+			end
+			part.Size = templateSize
+			part.Color = templateColor
+			for _, d in part:GetDescendants() do
+				if d:IsA("ParticleEmitter") then
+					d:Clear()
+				end
+			end
+			part.CFrame = Pool.PARK_CFRAME
+		end,
+		onDestroy = function(part: BasePart)
+			snapshotOf[part] = nil
+		end,
+	})
+
+	local pool = base :: PartPool
+	pool.snapshotOf = snapshotOf
+	pool.template = template
+	return pool
+end
+
+return Pool
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="24">
+        <Properties>
+          <string name="Name">Registry</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Registry
+	Stable effect name <-> network id table shared by server and clients.
+
+	To add an effect: create `Effects/MyEffect.luau` (returning a Types.Effect) and append
+	"MyEffect" at the END of the list (never reorder: ids are positional).
+]]
+
+local NAMES: { string } = {
+	"Slash",
+	"Shockwave",
+	"CraterRocks",
+	"ImpactBurst",
+	"GroundSlam",
+	"Parry",
+	"Block",
+	"GuardBreak",
+	"FistImpact",
+	"Telegraph",
+	-- Dark pixel-art theme (roblox-dark-pixel-style), registered at runtime.
+	"DarkSlash",
+	"DarkHit",
+	"DarkParry",
+	"DarkBlock",
+	"DarkGuardBreak",
+	"DarkTelegraph",
+}
+
+local Registry = {}
+
+local idByName: { [string]: number } = {}
+for id, name in NAMES do
+	idByName[name] = id
+end
+
+function Registry.idOf(name: string): number
+	local id = idByName[name]
+	if id == nil then
+		error(`[VFX.Registry] unknown effect "{name}" - add it to Registry.luau`, 2)
+	end
+	return id
+end
+
+function Registry.nameOf(id: number): string?
+	return NAMES[id]
+end
+
+function Registry.names(): { string }
+	return table.clone(NAMES)
+end
+
+return Registry
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="25">
+        <Properties>
+          <string name="Name">ScreenFlash</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	ScreenFlash
+	Post-processing impulses for impacts: color punch, bloom spike, blur pop and the
+	anime-style black & white "impact frame".
+
+	* Owns dedicated effects in Lighting ("VFX_ImpactColor", "VFX_ImpactBlur") that are
+	  neutral when idle, so the game's own grading is never overwritten.
+	* An existing BloomEffect is modulated relative to its captured base value, which fixes
+	  the classic drift bug (capturing `Intensity` mid-flash on rapid hits).
+	* Overlapping impulses are summed with per-impulse envelopes, then clamped.
+	* Honors GuiService.ReducedMotionEnabled: no impact frames, halved intensity.
+
+	Usage (client only):
+		ScreenFlash.impact({ duration = 0.12, contrast = 0.25, bloom = 1.5 })
+		ScreenFlash.impactFrame(0.06) -- 3-4 frames of high-contrast monochrome
+]]
+
+local GuiService = game:GetService("GuiService")
+local Lighting = game:GetService("Lighting")
+local RunService = game:GetService("RunService")
+
+local Ease = require(script.Parent.Ease)
+
+export type ImpactOptions = {
+	duration: number?,
+	brightness: number?,
+	contrast: number?,
+	saturation: number?,
+	tint: Color3?,
+	bloom: number?, -- added to the existing BloomEffect.Intensity
+	blur: number?, -- BlurEffect.Size at peak
+	peak: number?, -- 0..1 position of the envelope peak (default 0.1)
+}
+
+type Impulse = {
+	start: number,
+	duration: number,
+	options: ImpactOptions,
+}
+
+local ScreenFlash = {}
+
+local impulses: { Impulse } = {}
+local connection: RBXScriptConnection? = nil
+local bloomBase: number? = nil
+local bloomEffect: BloomEffect? = nil
+
+local function ownedColor(): ColorCorrectionEffect
+	local existing = Lighting:FindFirstChild("VFX_ImpactColor")
+	if existing and existing:IsA("ColorCorrectionEffect") then
+		return existing
+	end
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Name = "VFX_ImpactColor"
+	cc.Parent = Lighting
+	return cc
+end
+
+local function ownedBlur(): BlurEffect
+	local existing = Lighting:FindFirstChild("VFX_ImpactBlur")
+	if existing and existing:IsA("BlurEffect") then
+		return existing
+	end
+	local blur = Instance.new("BlurEffect")
+	blur.Name = "VFX_ImpactBlur"
+	blur.Size = 0
+	blur.Enabled = false
+	blur.Parent = Lighting
+	return blur
+end
+
+local function onFrame()
+	local now = os.clock()
+	local reduce = if GuiService.ReducedMotionEnabled then 0.5 else 1
+
+	local brightness, contrast, saturation, blurSize, bloom = 0, 0, 0, 0, 0
+	local tintR, tintG, tintB, tintWeight = 0, 0, 0, 0
+
+	local write = 0
+	for _, impulse in impulses do
+		local t = (now - impulse.start) / impulse.duration
+		if t >= 1 then
+			continue
+		end
+		write += 1
+		impulses[write] = impulse
+		local o = impulse.options
+		local e = Ease.pulse(math.max(t, 1e-3), o.peak or 0.1) * reduce
+		brightness += (o.brightness or 0) * e
+		contrast += (o.contrast or 0) * e
+		saturation += (o.saturation or 0) * e
+		blurSize += (o.blur or 0) * e
+		bloom += (o.bloom or 0) * e
+		if o.tint then
+			tintR += o.tint.R * e
+			tintG += o.tint.G * e
+			tintB += o.tint.B * e
+			tintWeight += e
+		end
+	end
+	for i = #impulses, write + 1, -1 do
+		impulses[i] = nil
+	end
+
+	local cc = ownedColor()
+	cc.Brightness = math.clamp(brightness, -1, 1)
+	cc.Contrast = math.clamp(contrast, -1, 3)
+	cc.Saturation = math.clamp(saturation, -1, 1)
+	if tintWeight > 0 then
+		local w = math.min(tintWeight, 1)
+		local tint = Color3.new(tintR / tintWeight, tintG / tintWeight, tintB / tintWeight)
+		cc.TintColor = Color3.new(1, 1, 1):Lerp(tint, w)
+	else
+		cc.TintColor = Color3.new(1, 1, 1)
+	end
+
+	local blur = ownedBlur()
+	blur.Size = blurSize
+	blur.Enabled = blurSize > 0.05
+
+	local bloomFx = bloomEffect
+	if bloomFx and bloomBase then
+		bloomFx.Intensity = bloomBase + bloom
+	end
+
+	if #impulses == 0 then
+		if bloomFx and bloomBase then
+			bloomFx.Intensity = bloomBase
+		end
+		bloomBase = nil
+		bloomEffect = nil
+		cc.Brightness, cc.Contrast, cc.Saturation = 0, 0, 0
+		blur.Enabled = false
+		if connection then
+			connection:Disconnect()
+			connection = nil
+		end
+	end
+end
+
+function ScreenFlash.impact(options: ImpactOptions)
+	local duration = options.duration or 0.12
+	if bloomBase == nil and (options.bloom or 0) ~= 0 then
+		local bloomFx = Lighting:FindFirstChildWhichIsA("BloomEffect")
+		if bloomFx then
+			bloomEffect = bloomFx
+			bloomBase = bloomFx.Intensity -- captured only while no impulse is running
+		end
+	end
+	table.insert(impulses, { start = os.clock(), duration = duration, options = options })
+	if connection == nil then
+		connection = RunService.PreRender:Connect(onFrame)
+	end
+end
+
+-- Manga "impact frame": a few frames of harsh monochrome. Skipped for reduced motion.
+function ScreenFlash.impactFrame(duration: number?)
+	if GuiService.ReducedMotionEnabled then
+		return
+	end
+	ScreenFlash.impact({
+		duration = duration or 0.06,
+		saturation = -1,
+		contrast = 2.2,
+		brightness = 0.08,
+		peak = 0.02,
+	})
+end
+
+return ScreenFlash
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="26">
+        <Properties>
+          <string name="Name">Shapes</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Shapes
+	Pooled building blocks for combat feedback, shared by the combat effects:
+	  flash(position, color, size, duration, light)   neon sphere + point light pop
+	  ring(frame, r0, r1, width, color, duration)      expanding BeamArc ring (plane = frame XZ)
+	  star(position, color, length, duration, rng)     crossed neon spikes: the "parry spark"
+	  shards(position, color, count, speed, rng)       glassy chips flung out (guard break)
+	  highlight(model, color, duration, name)          body flash (restarts on re-trigger)
+]]
+
+local Animator = require(script.Parent.Animator)
+local Assets = require(script.Parent.Assets)
+local BeamArc = require(script.Parent.BeamArc)
+local Ease = require(script.Parent.Ease)
+local Fade = require(script.Parent.Fade)
+local Pool = require(script.Parent.Pool)
+local VFXMath = require(script.Parent.VFXMath)
+
+local Shapes = {}
+
+local flashPool: Pool.PartPool? = nil
+local spikePool: Pool.PartPool? = nil
+local shardPool: Pool.PartPool? = nil
+local ringPool: Pool.Pool<BeamArc.BeamArc>? = nil
+local highlights: { [Instance]: { highlight: Highlight, handle: Animator.Handle? } } = setmetatable(
+	{},
+	{ __mode = "k" }
+) :: any
+
+local function getFlashPool(): Pool.PartPool
+	if flashPool == nil then
+		local template = Instance.new("Part")
+		template.Shape = Enum.PartType.Ball
+		template.Material = Enum.Material.Neon
+		template.Size = Vector3.one
+		local light = Instance.new("PointLight")
+		light.Range = 16
+		light.Brightness = 8
+		light.Shadows = false
+		light.Parent = template
+		flashPool = Pool.fromTemplate(template, Assets.workspaceFolder(), 8)
+	end
+	return flashPool :: Pool.PartPool
+end
+
+local function getSpikePool(): Pool.PartPool
+	if spikePool == nil then
+		local template = Instance.new("Part")
+		template.Material = Enum.Material.Neon
+		template.Size = Vector3.new(0.12, 0.12, 1)
+		spikePool = Pool.fromTemplate(template, Assets.workspaceFolder(), 12)
+	end
+	return spikePool :: Pool.PartPool
+end
+
+local function getShardPool(): Pool.PartPool
+	if shardPool == nil then
+		local template = Instance.new("WedgePart")
+		template.Material = Enum.Material.Glass
+		template.Transparency = 0.15
+		template.Size = Vector3.new(0.15, 0.6, 0.5)
+		shardPool = Pool.fromTemplate(template, Assets.workspaceFolder(), 12)
+	end
+	return shardPool :: Pool.PartPool
+end
+
+local function getRingPool(): Pool.Pool<BeamArc.BeamArc>
+	if ringPool == nil then
+		ringPool = Pool.new(function(): BeamArc.BeamArc
+			return BeamArc.new(Assets.workspaceFolder(), 4, { segmentsPerPiece = 8 })
+		end, {
+			prewarm = 4,
+			onRelease = function(arc: BeamArc.BeamArc)
+				arc:setEnabled(false)
+			end,
+		})
+	end
+	return ringPool :: Pool.Pool<BeamArc.BeamArc>
+end
+
+function Shapes.flash(position: Vector3, color: Color3, size: number, duration: number, lightBrightness: number?)
+	local pool = getFlashPool()
+	local part = pool:acquire()
+	local snapshot = pool.snapshotOf[part]
+	part.Color = color
+	local light = part:FindFirstChildWhichIsA("PointLight")
+	if light then
+		light.Color = color
+	end
+	part.CFrame = CFrame.new(position)
+	local brightness = lightBrightness or 8
+	Animator.play(duration, function(t)
+		part.Size = Vector3.one * size * Ease.lerp(0.3, 1, Ease.outExpo(t))
+		Fade.apply(snapshot, 1 - Ease.inQuad(t))
+		if light then
+			light.Brightness = brightness * (1 - t)
+		end
+	end, {
+		group = "ui", -- a flash must pop even during hitstop
+		onComplete = function()
+			pool:release(part)
+		end,
+	})
+end
+
+function Shapes.ring(
+	frame: CFrame,
+	r0: number,
+	r1: number,
+	width: number,
+	color: Color3,
+	duration: number,
+	delay: number?
+)
+	local pool = getRingPool()
+	local ring = pool:acquire()
+	ring:setColor(color)
+	ring:setFrame(frame)
+	ring:set(math.max(r0, 0.01), 0, 2 * math.pi, function()
+		return 0
+	end, 1)
+	ring:setEnabled(true)
+	Animator.play(duration, function(t)
+		local r = Ease.lerp(r0, r1, Ease.outExpo(t))
+		local w = width * (1 - Ease.outQuad(t))
+		ring:set(math.max(r, 0.01), 0, 2 * math.pi, function()
+			return w
+		end, Ease.lerp(0, 1, Ease.inQuad(t)))
+	end, {
+		group = "ui",
+		delay = delay,
+		onComplete = function()
+			pool:release(ring)
+		end,
+	})
+end
+
+-- The classic "parry spark": 3-4 crossed neon spikes that stretch out and vanish.
+function Shapes.star(position: Vector3, color: Color3, length: number, duration: number, rng: Random)
+	local pool = getSpikePool()
+	local count = 4
+	for i = 1, count do
+		local part = pool:acquire()
+		local snapshot = pool.snapshotOf[part]
+		part.Color = color
+		local orientation = CFrame.new(position)
+			* CFrame.Angles(0, rng:NextNumber() * math.pi, 0)
+			* CFrame.Angles((i / count) * math.pi + rng:NextNumber() * 0.3, 0, 0)
+		local thickness = VFXMath.randomRange(rng, 0.1, 0.22)
+		local len = length * VFXMath.randomRange(rng, 0.7, 1.2)
+		Animator.play(duration, function(t)
+			local grow = Ease.outExpo(Ease.phase(t, 0, 0.35))
+			local thin = 1 - Ease.inQuad(Ease.phase(t, 0.25, 1))
+			part.Size = Vector3.new(thickness * thin + 0.01, thickness * thin + 0.01, len * grow + 0.05)
+			Animator.move(part, orientation)
+			Fade.apply(snapshot, thin)
+		end, {
+			group = "ui",
+			onComplete = function()
+				pool:release(part)
+			end,
+		})
+	end
+end
+
+-- Chips flung outward with fake gravity (anchored, no physics cost).
+function Shapes.shards(position: Vector3, color: Color3, count: number, speed: number, rng: Random)
+	local pool = getShardPool()
+	for _ = 1, count do
+		local part = pool:acquire()
+		local snapshot = pool.snapshotOf[part]
+		part.Color = color
+		local velocity = VFXMath.randomInCone(rng, Vector3.yAxis, math.rad(75))
+			* speed
+			* VFXMath.randomRange(rng, 0.6, 1.2)
+		local spin = Vector3.new(rng:NextNumber(-12, 12), rng:NextNumber(-12, 12), rng:NextNumber(-12, 12))
+		local scale = VFXMath.randomRange(rng, 0.7, 1.6)
+		part.Size = Vector3.new(0.15, 0.6, 0.5) * scale
+		local lifetime = VFXMath.randomRange(rng, 0.5, 0.8)
+		Animator.play(lifetime, function(_t, _dt, elapsed)
+			local p = position + velocity * elapsed + Vector3.new(0, -60, 0) * (elapsed * elapsed * 0.5)
+			local r = spin * elapsed
+			Animator.move(part, CFrame.new(p) * CFrame.fromEulerAnglesXYZ(r.X, r.Y, r.Z))
+			Fade.apply(snapshot, 1 - Ease.inQuad(math.clamp(elapsed / lifetime, 0, 1)))
+		end, {
+			onComplete = function()
+				pool:release(part)
+			end,
+		})
+	end
+end
+
+function Shapes.highlight(model: Instance, color: Color3, duration: number, name: string, peak: number?)
+	if not model:IsA("Model") then
+		return
+	end
+	local key = model
+	local entry = highlights[key]
+	if entry == nil or entry.highlight.Parent == nil or entry.highlight.Name ~= name then
+		local h = Instance.new("Highlight")
+		h.Name = name
+		h.OutlineTransparency = 1
+		h.DepthMode = Enum.HighlightDepthMode.Occluded
+		h.Adornee = model
+		h.Parent = model
+		entry = { highlight = h, handle = nil }
+		highlights[key] = entry
+	end
+	local e = entry :: { highlight: Highlight, handle: Animator.Handle? }
+	if e.handle then
+		e.handle:cancel()
+	end
+	local h = e.highlight
+	h.FillColor = color
+	h.Enabled = true
+	local start = peak or 0.1
+	h.FillTransparency = start
+	e.handle = Animator.play(duration, function(t)
+		h.FillTransparency = Ease.lerp(start, 1, Ease.outQuad(t))
+	end, {
+		group = "ui",
+		onComplete = function(cancelled)
+			if not cancelled then
+				h.Enabled = false
+				e.handle = nil
+			end
+		end,
+	})
+end
+
+function Shapes.preload()
+	getFlashPool()
+	getSpikePool()
+	getShardPool()
+	getRingPool()
+end
+
+return Shapes
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="27">
+        <Properties>
+          <string name="Name">Spring</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Spring
+	Analytic (closed-form) damped harmonic oscillator on Vector3.
+
+	Unlike `v += (k*x - c*v) * dt` integrators, the exact solution is unconditionally
+	stable: a 200 ms frame hitch never makes it explode. Scalars can be packed into the
+	X/Y/Z components (e.g. pitch, roll, drop).
+
+	  frequency    : undamped oscillations per second (Hz). Higher = snappier.
+	  dampingRatio : 1 = critically damped (no overshoot), < 1 = bouncy, > 1 = sluggish.
+
+	Usage:
+		local spring = Spring.new(Vector3.zero, 6, 0.5)
+		spring:impulse(Vector3.new(0, -30, 0)) -- kick the velocity
+		RunService.PreRender:Connect(function(dt) local offset = spring:update(dt) end)
+]]
+
+export type Spring = {
+	position: Vector3,
+	velocity: Vector3,
+	target: Vector3,
+	frequency: number,
+	dampingRatio: number,
+	update: (self: Spring, dt: number) -> Vector3,
+	impulse: (self: Spring, velocity: Vector3) -> (),
+	reset: (self: Spring, position: Vector3?) -> (),
+}
+
+local Spring = {}
+Spring.__index = Spring
+
+local TAU = 2 * math.pi
+
+function Spring.new(initial: Vector3, frequency: number, dampingRatio: number): Spring
+	local self = setmetatable({
+		position = initial,
+		velocity = Vector3.zero,
+		target = initial,
+		frequency = frequency,
+		dampingRatio = dampingRatio,
+	}, Spring)
+	return (self :: any) :: Spring
+end
+
+-- Pure step function, exposed for tests and for code that stores state elsewhere.
+function Spring.step(
+	position: Vector3,
+	velocity: Vector3,
+	target: Vector3,
+	frequency: number,
+	dampingRatio: number,
+	dt: number
+): (Vector3, Vector3)
+	if dt <= 0 then
+		return position, velocity
+	end
+	local omega = TAU * math.max(frequency, 1e-4)
+	local zeta = math.max(dampingRatio, 0)
+	local x0 = position - target
+	local v0 = velocity
+
+	local x: Vector3
+	local v: Vector3
+	if zeta < 0.9999 then
+		-- Under-damped.
+		local a = zeta * omega
+		local wd = omega * math.sqrt(1 - zeta * zeta)
+		local decay = math.exp(-a * dt)
+		local c = math.cos(wd * dt)
+		local s = math.sin(wd * dt)
+		x = (x0 * c + (v0 + x0 * a) * (s / wd)) * decay
+		v = (v0 * c - (v0 * a + x0 * (omega * omega)) * (s / wd)) * decay
+	elseif zeta <= 1.0001 then
+		-- Critically damped.
+		local decay = math.exp(-omega * dt)
+		local b = v0 + x0 * omega
+		x = (x0 + b * dt) * decay
+		v = (v0 - b * (omega * dt)) * decay
+	else
+		-- Over-damped.
+		local root = math.sqrt(zeta * zeta - 1)
+		local r1 = -omega * (zeta - root)
+		local r2 = -omega * (zeta + root)
+		local c1 = (v0 - x0 * r2) / (r1 - r2)
+		local c2 = x0 - c1
+		local e1 = math.exp(r1 * dt)
+		local e2 = math.exp(r2 * dt)
+		x = c1 * e1 + c2 * e2
+		v = c1 * (r1 * e1) + c2 * (r2 * e2)
+	end
+	return target + x, v
+end
+
+function Spring.update(self: Spring, dt: number): Vector3
+	self.position, self.velocity =
+		Spring.step(self.position, self.velocity, self.target, self.frequency, self.dampingRatio, dt)
+	return self.position
+end
+
+function Spring.impulse(self: Spring, velocity: Vector3)
+	self.velocity += velocity
+end
+
+function Spring.reset(self: Spring, position: Vector3?)
+	local p = position or self.target
+	self.position = p
+	self.target = p
+	self.velocity = Vector3.zero
+end
+
+return Spring
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="28">
+        <Properties>
+          <string name="Name">TextureAnimator</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	TextureAnimator
+	UV scrolling and flipbooks, all driven by the shared Animator loop (one connection,
+	time-scaled by hitstop, errors isolated).
+
+	What scrolls on what (engine facts, check before promising an effect):
+	  * Texture (on a Part or MeshPart face)  -> OffsetStudsU/V. Face-projected, NOT the
+	    mesh UV map. Wraps cleanly at StudsPerTileU/V.            -> TextureAnimator.scroll
+	  * Decal                                 -> UVOffset / UVScale (newer API; test on
+	    target devices, it has had perf/distance issues).         -> TextureAnimator.scrollDecal
+	  * Beam / Trail                          -> native: Beam.TextureSpeed, Trail.TextureMode.
+	    No script needed and the cheapest option for energy flow.
+	  * MeshPart.TextureID (true mesh UVs)    -> cannot be offset; animate by swapping frames
+	    (TextureAnimator.flipbook) or use a spritesheet on a Decal (spritesheet).
+
+	Usage:
+		local stop = TextureAnimator.scroll(texture, Vector2.new(0, 12)) -- studs / second
+		TextureAnimator.flipbook(meshPart, frames, 24, true)
+		stop()
+]]
+
+local Animator = require(script.Parent.Animator)
+
+export type Stop = () -> ()
+
+local TextureAnimator = {}
+
+local function wrap(value: number, period: number): number
+	if period <= 0 then
+		return value
+	end
+	return value % period -- Luau % is floored: always in [0, period)
+end
+
+-- Scrolls a Texture by `speed` studs/second. Offsets are wrapped by StudsPerTile so
+-- long-lived auras never lose float precision and never visibly jump.
+function TextureAnimator.scroll(texture: Texture, speed: Vector2, group: string?): Stop
+	local handle = Animator.bind(function(dt)
+		if texture.Parent == nil then
+			return
+		end
+		texture.OffsetStudsU = wrap(texture.OffsetStudsU + speed.X * dt, texture.StudsPerTileU)
+		texture.OffsetStudsV = wrap(texture.OffsetStudsV + speed.Y * dt, texture.StudsPerTileV)
+	end, { group = group })
+	return function()
+		handle:cancel()
+	end
+end
+
+-- Scrolls a Decal through UVOffset (units: UV per second, 1 = one full tile).
+function TextureAnimator.scrollDecal(decal: Decal, speed: Vector2, group: string?): Stop
+	local handle = Animator.bind(function(dt)
+		if decal.Parent == nil then
+			return
+		end
+		local o = decal.UVOffset
+		decal.UVOffset = Vector2.new(wrap(o.X + speed.X * dt, 1), wrap(o.Y + speed.Y * dt, 1))
+	end, { group = group })
+	return function()
+		handle:cancel()
+	end
+end
+
+type FlipbookTarget = Decal | MeshPart
+
+local function setFrame(target: FlipbookTarget, id: string)
+	if target:IsA("MeshPart") then
+		target.TextureID = id
+	elseif target:IsA("Decal") then -- Decal or Texture
+		target.Texture = id
+	end
+end
+
+--[[
+	Cycles through separate image ids (preload them first with ContentProvider or the
+	first loop will flicker). Works on MeshPart.TextureID (true mesh UVs), Decal, Texture.
+]]
+function TextureAnimator.flipbook(
+	target: FlipbookTarget,
+	frames: { string },
+	fps: number,
+	loop: boolean,
+	group: string?
+): Stop
+	local count = #frames
+	if count == 0 then
+		return function() end
+	end
+	local current = 0
+	local handle
+	handle = Animator.bind(function(_dt, elapsed)
+		local index = math.floor(elapsed * fps)
+		if not loop and index >= count then
+			setFrame(target, frames[count])
+			handle:cancel()
+			return
+		end
+		index = index % count + 1
+		if index ~= current then
+			current = index
+			setFrame(target, frames[index])
+		end
+	end, { group = group })
+	return function()
+		handle:cancel()
+	end
+end
+
+--[[
+	Plays a spritesheet (cols x rows grid, row-major, top-left first) on a Decal through
+	UVScale/UVOffset: one texture upload, no per-frame asset swap.
+]]
+function TextureAnimator.spritesheet(
+	decal: Decal,
+	cols: number,
+	rows: number,
+	frameCount: number,
+	fps: number,
+	loop: boolean,
+	group: string?
+): Stop
+	decal.UVScale = Vector2.new(1 / cols, 1 / rows)
+	local handle
+	handle = Animator.bind(function(_dt, elapsed)
+		local index = math.floor(elapsed * fps)
+		if not loop and index >= frameCount then
+			index = frameCount - 1
+			handle:cancel()
+		end
+		index %= frameCount
+		local col = index % cols
+		local row = math.floor(index / cols)
+		decal.UVOffset = Vector2.new(col / cols, row / rows)
+	end, { group = group })
+	return function()
+		handle:cancel()
+	end
+end
+
+TextureAnimator._wrap = wrap
+
+return TextureAnimator
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="29">
+        <Properties>
+          <string name="Name">Types</string>
+          <string name="Source"><![CDATA[--!strict
+-- Shared type definitions for the VFX library.
+
+export type EffectParams = {
+	name: string,
+	cframe: CFrame, -- effect frame: UpVector = surface / slash-plane normal, LookVector = forward
+	scale: number, -- 1 = authored size
+	color: Color3?, -- nil = authored color
+	power: number, -- 0..5, drives counts / intensity / camera feedback
+	variant: number, -- 0..255, effect-specific (mirror, style...)
+	seed: number, -- 0..65535, identical on every client -> identical randomness
+	source: Instance?, -- attacker character (optional)
+	target: Instance?, -- victim character (optional)
+}
+
+export type EffectContext = {
+	quality: number, -- 0..1 (adaptive quality / user setting)
+	distance: number, -- camera distance to the effect origin
+	isLocalSource: boolean, -- the local player caused it (camera shake, hitstop)
+	isLocalTarget: boolean, -- the local player got hit
+	rng: Random, -- seeded with params.seed
+}
+
+export type Effect = {
+	maxDistance: number?, -- culled beyond this camera distance (default 400 studs)
+	preload: (() -> ())?, -- build pools / fetch templates ahead of the first hit
+	play: (params: EffectParams, ctx: EffectContext) -> (),
+}
+
+return {}
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="30">
+        <Properties>
+          <string name="Name">VFXMath</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	VFXMath
+	Pure geometry helpers (no services) - unit-tested under Lune with real CFrame math.
+
+	Conventions used by every effect in this library:
+	  * An effect "frame" is a CFrame whose UpVector is the surface normal / slash plane
+	    normal and whose LookVector is the forward direction of the effect.
+	  * Arc angles are measured around the frame's +Y axis starting from -Z (forward),
+	    positive = counter-clockwise seen from above (towards -X / the left).
+]]
+
+local VFXMath = {}
+
+local EPSILON = 1e-4
+
+--[[
+	Builds a right-handed CFrame at `position` whose UpVector is `normal` and whose
+	LookVector is `forwardHint` projected onto the surface plane.
+
+	This replaces the classic (and wrong) `CFrame.fromMatrix(pos, right, up, -look)`
+	pattern, which produces a mirrored (left-handed) matrix when `look = right:Cross(up)`.
+]]
+function VFXMath.alignToNormal(position: Vector3, normal: Vector3, forwardHint: Vector3?): CFrame
+	local up = if normal.Magnitude > EPSILON then normal.Unit else Vector3.yAxis
+	local forward = forwardHint or -Vector3.zAxis
+	forward -= up * forward:Dot(up)
+	if forward.Magnitude < EPSILON then
+		-- Hint parallel to the normal: pick any stable perpendicular.
+		forward = Vector3.xAxis - up * up.X
+		if forward.Magnitude < EPSILON then
+			forward = Vector3.zAxis - up * up.Z
+		end
+	end
+	forward = forward.Unit
+	local right = forward:Cross(up)
+	-- fromMatrix(pos, X, Y, Z): X = right, Y = up, Z = back (= -look). X:Cross(Y) == Z.
+	return CFrame.fromMatrix(position, right, up, -forward)
+end
+
+--[[
+	CFrame at `position` whose LookVector is exactly `direction` (UpVector as close to
+	`upHint` as possible). Same result as CFrame.lookAt(position, position + direction),
+	built with fromMatrix so it also runs in test runtimes whose lookAt is unreliable.
+]]
+function VFXMath.lookAlong(position: Vector3, direction: Vector3, upHint: Vector3?): CFrame
+	local look = if direction.Magnitude > EPSILON then direction.Unit else -Vector3.zAxis
+	local up = upHint or Vector3.yAxis
+	local right = look:Cross(up)
+	if right.Magnitude < EPSILON then
+		right = look:Cross(if math.abs(look.X) < 0.9 then Vector3.xAxis else Vector3.zAxis)
+	end
+	right = right.Unit
+	return CFrame.fromMatrix(position, right, right:Cross(look), -look)
+end
+
+-- Point on a circle of radius r lying in the frame's XZ plane, at arc angle `angle`.
+function VFXMath.arcPoint(radius: number, angle: number): Vector3
+	return Vector3.new(-radius * math.sin(angle), 0, -radius * math.cos(angle))
+end
+
+-- Unit tangent of the arc at `angle`, pointing towards increasing angles.
+function VFXMath.arcTangent(angle: number): Vector3
+	return Vector3.new(-math.cos(angle), 0, math.sin(angle))
+end
+
+--[[
+	Local CFrame for an Attachment sitting on the arc so that a Beam's Bezier handles
+	(which extend along the attachment's +X axis) follow the circle.
+]]
+function VFXMath.arcAttachmentCFrame(radius: number, angle: number): CFrame
+	return CFrame.fromMatrix(VFXMath.arcPoint(radius, angle), VFXMath.arcTangent(angle), Vector3.yAxis)
+end
+
+--[[
+	Beam CurveSize that makes a cubic Bezier approximate a circular arc of `sweep`
+	radians (k = 4/3 * tan(sweep / 4) * r). Error < 0.03% of the radius for 90 deg arcs,
+	so split larger arcs into <= 90 deg pieces.
+]]
+function VFXMath.arcCurveSize(radius: number, sweep: number): number
+	return (4 / 3) * math.tan(sweep / 4) * radius
+end
+
+-- Evaluates a cubic Bezier (used by tests and by effects that need points along a beam).
+function VFXMath.bezier(p0: Vector3, p1: Vector3, p2: Vector3, p3: Vector3, t: number): Vector3
+	local u = 1 - t
+	return p0 * (u * u * u) + p1 * (3 * u * u * t) + p2 * (3 * u * t * t) + p3 * (t * t * t)
+end
+
+-- Random unit vector inside a cone of half-angle `angle` (radians) around `direction`.
+function VFXMath.randomInCone(rng: Random, direction: Vector3, angle: number): Vector3
+	local dir = if direction.Magnitude > EPSILON then direction.Unit else Vector3.yAxis
+	-- Uniform on the spherical cap.
+	local cosAngle = math.cos(angle)
+	local z = cosAngle + (1 - cosAngle) * rng:NextNumber()
+	local phi = rng:NextNumber() * 2 * math.pi
+	local r = math.sqrt(math.max(0, 1 - z * z))
+	local localDir = Vector3.new(r * math.cos(phi), r * math.sin(phi), -z)
+	-- Frame whose LookVector (-Z) is `dir`.
+	return VFXMath.lookAlong(Vector3.zero, dir):VectorToWorldSpace(localDir)
+end
+
+function VFXMath.randomRange(rng: Random, min: number, max: number): number
+	return min + (max - min) * rng:NextNumber()
+end
+
+-- Opacity (1 = visible) <-> Transparency (1 = invisible) helpers for layered fades.
+function VFXMath.combineTransparency(baseTransparency: number, opacity: number): number
+	return 1 - (1 - baseTransparency) * math.clamp(opacity, 0, 1)
+end
+
+--[[
+	Deterministic ring layout used by crater/debris effects. Returns `count` angles
+	spread around the circle with a random jitter of +-(jitter * step / 2).
+	Seeded -> every client builds the exact same crater.
+]]
+function VFXMath.ringAngles(rng: Random, count: number, jitter: number): { number }
+	local angles = table.create(count)
+	local step = 2 * math.pi / count
+	local offset = rng:NextNumber() * step
+	for i = 1, count do
+		angles[i] = offset + (i - 1) * step + (rng:NextNumber() - 0.5) * step * jitter
+	end
+	return angles
+end
+
+return VFXMath
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+    <Item class="Folder" referent="31">
+      <Properties>
+        <string name="Name">VFXDemo</string>
+      </Properties>
+      <Item class="ModuleScript" referent="32">
+        <Properties>
+          <string name="Name">DemoMoves</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	DemoMoves
+	Move geometry shared by the demo client (prediction) and server (authority), so both
+	compute the same frames from the same inputs. Real games keep this pattern: the
+	client never sends positions, only intent (+ a seed); the server recomputes.
+]]
+
+local DemoMoves = {}
+
+DemoMoves.COOLDOWNS = {
+	Slash = 0.28,
+	GroundSlam = 1.1,
+}
+
+-- Alternating diagonal slashes: variant bit 0 mirrors the sweep and the tilt.
+function DemoMoves.slashFrame(root: CFrame, variant: number): CFrame
+	local tilt = if bit32.band(variant, 1) == 1 then math.rad(-28) else math.rad(28)
+	return root * CFrame.new(0, 0.6, -2.4) * CFrame.Angles(0, 0, tilt)
+end
+
+function DemoMoves.groundSlamFrame(root: CFrame): CFrame
+	return root * CFrame.new(0, -2.5, -7)
+end
+
+-- Hit box in front of the attacker (server-side only in the demo).
+function DemoMoves.hitBox(root: CFrame): (CFrame, Vector3)
+	return root * CFrame.new(0, 0, -3.8), Vector3.new(6, 6, 6)
+end
+
+return DemoMoves
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="33">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="34">
+      <Properties>
+        <string name="Name">VFXDemoServer</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[--!strict
+--[[
+	Demo server: validated combat requests -> VFXService broadcasts.
+
+	Security model shown here (copy it for real abilities):
+	  * the client sends only intent: action name, variant and a random seed;
+	  * the server checks types/ranges, per-action cooldowns and character state;
+	  * every position is recomputed from the server's view of the character;
+	  * hits are detected server-side, then ImpactBurst is sent to everyone.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+
+local VFXService = require(ServerScriptService:WaitForChild("VFXServer"):WaitForChild("VFXService"))
+local DemoMoves = require(ReplicatedStorage:WaitForChild("VFXDemo"):WaitForChild("DemoMoves"))
+
+VFXService.start()
+
+local request = Instance.new("RemoteEvent")
+request.Name = "VFXDemoRequest"
+request.Parent = ReplicatedStorage
+
+local lastUse: { [Player]: { [string]: number } } = {}
+local comboCount: { [Player]: number } = {}
+
+local function spawnDummy()
+	local ok, dummy = pcall(function()
+		local description = Instance.new("HumanoidDescription")
+		return Players:CreateHumanoidModelFromDescription(description, Enum.HumanoidRigType.R6)
+	end)
+	if not ok or dummy == nil then
+		warn("[VFXDemo] could not create a training dummy:", dummy)
+		return
+	end
+	local model = dummy :: Model
+	model.Name = "TrainingDummy"
+	local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+	local origin = if spawn then spawn.Position else Vector3.new(0, 0, 0)
+	model:PivotTo(CFrame.new(origin + Vector3.new(0, 4, -16)) * CFrame.Angles(0, math.pi, 0))
+	model.Parent = workspace
+end
+
+local function characterRoot(player: Player): (Model?, BasePart?)
+	local character = player.Character
+	if character == nil then
+		return nil, nil
+	end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if humanoid == nil or humanoid.Health <= 0 or root == nil or not root:IsA("BasePart") then
+		return nil, nil
+	end
+	return character, root
+end
+
+local function onCooldown(player: Player, action: string): boolean
+	local cooldown = DemoMoves.COOLDOWNS[action]
+	if cooldown == nil then
+		return true
+	end
+	local uses = lastUse[player]
+	if uses == nil then
+		uses = {}
+		lastUse[player] = uses
+	end
+	local now = os.clock()
+	local usesTable = uses :: { [string]: number }
+	if now - (usesTable[action] or -math.huge) < cooldown * 0.9 then -- 10% latency grace
+		return true
+	end
+	usesTable[action] = now
+	return false
+end
+
+local function findVictim(attacker: Model, root: BasePart): Model?
+	local boxCFrame, boxSize = DemoMoves.hitBox(root.CFrame)
+	local params = OverlapParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { attacker }
+	local best: Model? = nil
+	local bestDistance = math.huge
+	for _, part in workspace:GetPartBoundsInBox(boxCFrame, boxSize, params) do
+		local model = part:FindFirstAncestorOfClass("Model")
+		local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+		if model and humanoid and humanoid.Health > 0 then
+			local distance = (part.Position - root.Position).Magnitude
+			if distance < bestDistance then
+				best, bestDistance = model, distance
+			end
+		end
+	end
+	return best
+end
+
+request.OnServerEvent:Connect(function(player: Player, action: unknown, variant: unknown, seed: unknown)
+	if type(action) ~= "string" or type(variant) ~= "number" or type(seed) ~= "number" then
+		return
+	end
+	if variant ~= variant or seed ~= seed then -- NaN guard
+		return
+	end
+	local safeVariant = math.clamp(math.floor(variant), 0, 3)
+	local safeSeed = math.clamp(math.floor(seed), 0, 65535)
+	local character, root = characterRoot(player)
+	if character == nil or root == nil or onCooldown(player, action) then
+		return
+	end
+
+	if action == "Slash" then
+		VFXService.play("Slash", {
+			cframe = DemoMoves.slashFrame(root.CFrame, safeVariant),
+			power = 1.2,
+			variant = safeVariant,
+			seed = safeSeed,
+			source = character,
+		}, { exclude = player }) -- the attacker already predicted it
+
+		local victim = findVictim(character, root)
+		if victim then
+			local combo = (comboCount[player] or 0) + 1
+			comboCount[player] = combo
+			local victimRoot = victim:FindFirstChild("HumanoidRootPart")
+			local hitPosition = if victimRoot and victimRoot:IsA("BasePart")
+				then victimRoot.Position
+				else root.Position + root.CFrame.LookVector * 3
+			VFXService.play("ImpactBurst", {
+				cframe = CFrame.lookAt(hitPosition, hitPosition + root.CFrame.LookVector),
+				power = if combo % 3 == 0 then 2.5 else 1.2,
+				variant = if combo % 3 == 0 then 1 else 0, -- every 3rd hit is a critical
+				seed = safeSeed,
+				source = character,
+				target = victim,
+			})
+		end
+	elseif action == "GroundSlam" then
+		VFXService.play("GroundSlam", {
+			cframe = DemoMoves.groundSlamFrame(root.CFrame),
+			power = 2,
+			seed = safeSeed,
+			source = character,
+		}, { exclude = player })
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	lastUse[player] = nil
+	comboCount[player] = nil
+end)
+
+spawnDummy()
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="35">
+      <Properties>
+        <string name="Name">VFXServer</string>
+      </Properties>
+      <Item class="Script" referent="36">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[--!strict
+-- ServerScriptService.VFXServer.Main: creates the VFX remotes and the batching loop.
+local VFXService = require(script.Parent:WaitForChild("VFXService"))
+
+VFXService.start()
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="37">
+        <Properties>
+          <string name="Name">VFXService</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	VFXService (server)
+	The server never renders effects. It validates gameplay, then sends compact effect
+	records to the clients that can actually see them.
+
+	* Batching: every record queued during a frame is packed into as few packets as
+	  possible (28 records per packet, 31 bytes each) and flushed once on Heartbeat.
+	* Interest management: only players within `radius` of the effect receive it.
+	* Unreliable by default (cosmetic, latest-wins); `reliable = true` for effects that
+	  must not be lost (ultimates, cutscene beats).
+	* Prediction friendly: `exclude = attackerPlayer` when the attacker already played
+	  the effect locally.
+
+	Usage:
+		local VFXService = require(ServerScriptService.VFXServer.VFXService)
+		VFXService.start()
+		VFXService.play("GroundSlam", { cframe = CFrame.new(pos), power = 2, seed = seed })
+		VFXService.play("ImpactBurst", {
+			cframe = CFrame.lookAt(hitPos, hitPos + swingDir),
+			source = attacker.Character, target = victim.Character, power = 1.5,
+		}, { radius = 250 })
+]]
+
+local PhysicsService = game:GetService("PhysicsService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local VFX = ReplicatedStorage:WaitForChild("VFX")
+local Net = require(VFX:WaitForChild("Net"))
+local Registry = require(VFX:WaitForChild("Registry"))
+
+export type PlayParams = {
+	cframe: CFrame,
+	scale: number?,
+	color: Color3?,
+	power: number?,
+	variant: number?,
+	seed: number?,
+	source: Instance?,
+	target: Instance?,
+}
+
+export type PlayOptions = {
+	radius: number?, -- default 500 studs
+	exclude: Player?, -- typically the attacker who predicted the effect
+	only: { Player }?, -- explicit recipients
+	reliable: boolean?,
+}
+
+type Queued = {
+	record: Net.Record,
+	source: Instance?,
+	target: Instance?,
+}
+
+type Outbox = { unreliable: { Queued }, reliable: { Queued } }
+
+local VFXService = {}
+
+-- UnreliableRemoteEvent drops payloads above ~900 bytes; keep a safety margin.
+local UNRELIABLE_BUDGET = 820
+local INSTANCE_REF_BYTES = 12
+
+local remotes: Folder? = nil
+local unreliableRemote: UnreliableRemoteEvent? = nil
+local reliableRemote: RemoteEvent? = nil
+local outboxes: { [Player]: Outbox } = {}
+
+local function outboxFor(player: Player): Outbox
+	local box = outboxes[player]
+	if box == nil then
+		box = { unreliable = {}, reliable = {} }
+		outboxes[player] = box
+	end
+	return box :: Outbox
+end
+
+local function recipients(position: Vector3, options: PlayOptions?): { Player }
+	if options and options.only then
+		return options.only
+	end
+	local radius = if options and options.radius then options.radius else 500
+	local exclude = options and options.exclude
+	local list = {}
+	for _, player in Players:GetPlayers() do
+		if player == exclude then
+			continue
+		end
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		-- Players without a character (spectating / loading) still receive nearby-only
+		-- effects conservatively: include them, the client culls by camera distance.
+		if root == nil or not root:IsA("BasePart") or (root.Position - position).Magnitude <= radius then
+			table.insert(list, player)
+		end
+	end
+	return list
+end
+
+function VFXService.play(name: string, params: PlayParams, options: PlayOptions?)
+	local record: Net.Record = {
+		id = Registry.idOf(name),
+		seed = params.seed or math.random(0, 65535),
+		cframe = params.cframe,
+		scale = params.scale or 1,
+		color = params.color,
+		power = params.power or 1,
+		variant = params.variant or 0,
+		sourceIndex = 0,
+		targetIndex = 0,
+	}
+	local queued: Queued = { record = record, source = params.source, target = params.target }
+	local reliable = options ~= nil and options.reliable == true
+	for _, player in recipients(params.cframe.Position, options) do
+		local box = outboxFor(player)
+		table.insert(if reliable then box.reliable else box.unreliable, queued)
+	end
+end
+
+local function send(player: Player, list: { Queued }, reliable: boolean)
+	local packetRecords: { Net.Record } = {}
+	local instances: { Instance } = {}
+	local indexOf: { [Instance]: number } = {}
+
+	local function indexFor(inst: Instance?): number
+		if inst == nil then
+			return 0
+		end
+		local index = indexOf[inst]
+		if index == nil then
+			if #instances >= 255 then
+				return 0
+			end
+			table.insert(instances, inst)
+			index = #instances
+			indexOf[inst] = index
+		end
+		return index :: number
+	end
+
+	local function flush()
+		if #packetRecords == 0 then
+			return
+		end
+		local payload = Net.encode(packetRecords)
+		if reliable then
+			(reliableRemote :: RemoteEvent):FireClient(player, payload, instances)
+		else
+			(unreliableRemote :: UnreliableRemoteEvent):FireClient(player, payload, instances)
+		end
+		packetRecords, instances, indexOf = {}, {}, {}
+	end
+
+	-- Conservative byte estimate: header + records + instance references.
+	local function estimate(extraRecords: number, extraInstances: number): number
+		return 1
+			+ Net.RECORD_SIZE * (#packetRecords + extraRecords)
+			+ INSTANCE_REF_BYTES * (#instances + extraInstances)
+	end
+
+	for _, item in list do
+		local newRefs = 0
+		if item.source and indexOf[item.source] == nil then
+			newRefs += 1
+		end
+		if item.target and item.target ~= item.source and indexOf[item.target] == nil then
+			newRefs += 1
+		end
+		if #packetRecords >= Net.MAX_RECORDS or (not reliable and estimate(1, newRefs) > UNRELIABLE_BUDGET) then
+			flush()
+		end
+		-- Records are shared between recipients: copy before stamping indices.
+		local record = table.clone(item.record)
+		record.sourceIndex = indexFor(item.source)
+		record.targetIndex = indexFor(item.target)
+		table.insert(packetRecords, record)
+	end
+	flush()
+end
+
+local function onHeartbeat()
+	for player, box in outboxes do
+		if player.Parent == nil then
+			outboxes[player] = nil
+			continue
+		end
+		if #box.unreliable > 0 then
+			send(player, box.unreliable, false)
+			table.clear(box.unreliable)
+		end
+		if #box.reliable > 0 then
+			send(player, box.reliable, true)
+			table.clear(box.reliable)
+		end
+	end
+end
+
+local function setupCollisionGroup()
+	local ok, err = pcall(function()
+		if not PhysicsService:IsCollisionGroupRegistered("VFXDebris") then
+			PhysicsService:RegisterCollisionGroup("VFXDebris")
+		end
+		PhysicsService:CollisionGroupSetCollidable("VFXDebris", "VFXDebris", false)
+		-- If the game puts characters in a "Characters" group, debris never push them.
+		if PhysicsService:IsCollisionGroupRegistered("Characters") then
+			PhysicsService:CollisionGroupSetCollidable("VFXDebris", "Characters", false)
+		end
+	end)
+	if not ok then
+		warn("[VFXService] collision group setup failed:", err)
+	end
+end
+
+function VFXService.start()
+	if remotes then
+		return
+	end
+	local folder = Instance.new("Folder")
+	folder.Name = "VFXRemotes"
+
+	local unreliable = Instance.new("UnreliableRemoteEvent")
+	unreliable.Name = "Unreliable"
+	unreliable.Parent = folder
+
+	local reliable = Instance.new("RemoteEvent")
+	reliable.Name = "Reliable"
+	reliable.Parent = folder
+
+	folder.Parent = ReplicatedStorage
+	remotes, unreliableRemote, reliableRemote = folder, unreliable, reliable
+
+	setupCollisionGroup()
+	RunService.Heartbeat:Connect(onHeartbeat)
+	Players.PlayerRemoving:Connect(function(player)
+		outboxes[player] = nil
+	end)
+end
+
+function VFXService.remotes(): Folder
+	assert(remotes, "VFXService.start() must be called first")
+	return remotes
+end
+
+return VFXService
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="38">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="39">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="40">
+        <Properties>
+          <string name="Name">VFXClient</string>
+        </Properties>
+        <Item class="LocalScript" referent="41">
+          <Properties>
+            <string name="Name">VFXBootstrap</string>
+            <string name="Source"><![CDATA[--!strict
+-- StarterPlayerScripts: boots the VFX client (remote listeners, pools, preloading).
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local VFXClient = require(ReplicatedStorage:WaitForChild("VFX"):WaitForChild("Client"))
+
+VFXClient.start()
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="LocalScript" referent="42">
+        <Properties>
+          <string name="Name">VFXDemoClient</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Demo client: Q = slash (alternating diagonals), E = ground slam.
+	Effects are predicted locally (zero input lag) and the server broadcasts them to the
+	other players with `exclude = attacker`. Both sides share the random seed, so the
+	crater rocks are identical on every screen.
+]]
+
+local ContextActionService = game:GetService("ContextActionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local VFX = ReplicatedStorage:WaitForChild("VFX")
+local VFXClient = require(VFX:WaitForChild("Client"))
+local DemoMoves = require(ReplicatedStorage:WaitForChild("VFXDemo"):WaitForChild("DemoMoves"))
+
+local request = ReplicatedStorage:WaitForChild("VFXDemoRequest") :: RemoteEvent
+local player = Players.LocalPlayer
+
+VFXClient.start()
+
+local slashVariant = 0
+local lastUse: { [string]: number } = {}
+
+local function ready(action: string): boolean
+	local now = os.clock()
+	if now - (lastUse[action] or -math.huge) < DemoMoves.COOLDOWNS[action] then
+		return false
+	end
+	lastUse[action] = now
+	return true
+end
+
+local function root(): BasePart?
+	local character = player.Character
+	local part = character and character:FindFirstChild("HumanoidRootPart")
+	return if part and part:IsA("BasePart") then part else nil
+end
+
+local function onSlash(_name: string, state: Enum.UserInputState)
+	if state ~= Enum.UserInputState.Begin or not ready("Slash") then
+		return Enum.ContextActionResult.Pass
+	end
+	local hrp = root()
+	if hrp == nil then
+		return Enum.ContextActionResult.Pass
+	end
+	slashVariant = 1 - slashVariant
+	local seed = math.random(0, 65535)
+	VFXClient.play("Slash", {
+		cframe = DemoMoves.slashFrame(hrp.CFrame, slashVariant),
+		power = 1.2,
+		variant = slashVariant,
+		seed = seed,
+		source = player.Character,
+	})
+	request:FireServer("Slash", slashVariant, seed)
+	return Enum.ContextActionResult.Sink
+end
+
+local function onGroundSlam(_name: string, state: Enum.UserInputState)
+	if state ~= Enum.UserInputState.Begin or not ready("GroundSlam") then
+		return Enum.ContextActionResult.Pass
+	end
+	local hrp = root()
+	if hrp == nil then
+		return Enum.ContextActionResult.Pass
+	end
+	local seed = math.random(0, 65535)
+	VFXClient.play("GroundSlam", {
+		cframe = DemoMoves.groundSlamFrame(hrp.CFrame),
+		power = 2,
+		seed = seed,
+		source = player.Character,
+	})
+	request:FireServer("GroundSlam", 0, seed)
+	return Enum.ContextActionResult.Sink
+end
+
+ContextActionService:BindAction("VFXDemoSlash", onSlash, true, Enum.KeyCode.Q, Enum.KeyCode.ButtonX)
+ContextActionService:BindAction("VFXDemoGroundSlam", onGroundSlam, true, Enum.KeyCode.E, Enum.KeyCode.ButtonY)
+ContextActionService:SetTitle("VFXDemoSlash", "Slash")
+ContextActionService:SetTitle("VFXDemoGroundSlam", "Slam")
+
+-- On-screen help.
+local gui = Instance.new("ScreenGui")
+gui.Name = "VFXDemoHelp"
+gui.ResetOnSpawn = false
+local label = Instance.new("TextLabel")
+label.AnchorPoint = Vector2.new(0.5, 1)
+label.Position = UDim2.new(0.5, 0, 1, -24)
+label.Size = UDim2.fromOffset(460, 36)
+label.BackgroundTransparency = 0.4
+label.BackgroundColor3 = Color3.new(0, 0, 0)
+label.TextColor3 = Color3.new(1, 1, 1)
+label.Font = Enum.Font.GothamMedium
+label.TextSize = 16
+label.Text = "Q: Slash (hit the dummy, every 3rd hit crits)   E: Ground slam"
+label.Parent = gui
+gui.Parent = player:WaitForChild("PlayerGui")
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="43">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="44">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">6512217</Color3uint8>
+        <bool name="Locked">true</bool>
+        <token name="Material">816</token>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-10</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>20</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+    <Item class="SpawnLocation" referent="45">
+      <Properties>
+        <string name="Name">SpawnLocation</string>
+        <bool name="Anchored">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>0.5</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>12</X>
+          <Y>1</Y>
+          <Z>12</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

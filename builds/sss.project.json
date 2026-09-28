@@ -1,0 +1,5 @@
+{"name":"DarkKit_ServerScriptService","tree":{"$className":"Folder",
+"CombatServer":{"$path":"../.claude/skills/roblox-deepwoken-combat/src/server"},
+"VFXServer":{"$className":"Folder","VFXService":{"$path":"../.claude/skills/roblox-mesh-vfx/src/server/VFXService.luau"}},
+"R6ProceduralServer":{"$path":"../.claude/skills/roblox-r6-procedural-animation/src/server"},
+"CombatArena_Demo":{"$path":"../.claude/skills/roblox-deepwoken-combat/src/demo/Arena.server.luau"}}}

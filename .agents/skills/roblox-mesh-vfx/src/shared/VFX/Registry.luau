@@ -13,6 +13,18 @@ local NAMES: { string } = {
 	"CraterRocks",
 	"ImpactBurst",
 	"GroundSlam",
+	"Parry",
+	"Block",
+	"GuardBreak",
+	"FistImpact",
+	"Telegraph",
+	-- Dark pixel-art theme (roblox-dark-pixel-style), registered at runtime.
+	"DarkSlash",
+	"DarkHit",
+	"DarkParry",
+	"DarkBlock",
+	"DarkGuardBreak",
+	"DarkTelegraph",
 }
 
 local Registry = {}

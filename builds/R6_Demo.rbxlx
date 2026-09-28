@@ -1,0 +1,2375 @@
+<roblox version="4">
+  <Item class="ReplicatedStorage" referent="0">
+    <Properties>
+      <string name="Name">ReplicatedStorage</string>
+    </Properties>
+    <Item class="Folder" referent="1">
+      <Properties>
+        <string name="Name">R6Procedural</string>
+      </Properties>
+      <Item class="ModuleScript" referent="2">
+        <Properties>
+          <string name="Name">Config</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Config
+	Every tunable of the procedural R6 system, with the reasoning behind the defaults.
+	Override at start: Controller.start({ lean = { speedLean = math.rad(8) } })
+
+	Per-character runtime control uses Attributes on the character Model (multipliers
+	0..1, default 1): R6_Lean, R6_Terrain, R6_HeadLook, R6_Landing, R6_Breathing,
+	R6_Disabled (boolean). Set them from attack/stun code, e.g. HeadLook = 0 while a
+	heavy attack animation must not be disturbed. Attributes set by the server replicate.
+]]
+
+local Config = {}
+
+Config.defaults = {
+	lod = {
+		fullRateDistance = 60, -- studs from the camera: sensing every frame
+		halfRateDistance = 120, -- sensing at 30 Hz
+		lowRateDistance = 200, -- sensing at 15 Hz; beyond: procedural motion disabled
+		offscreenInterval = 1 / 10, -- sensing rate for characters outside the view
+	},
+
+	sensing = {
+		rayLength = 5.5, -- from root height: rest foot (3) + max step-down + margin
+		lookAhead = 0.06, -- seconds of velocity used to shift foot rays forward
+		groundTolerance = 0.75, -- extra distance still considered "grounded"
+		velocitySharpness = 14, -- exp smoothing of position-derived velocity
+		accelerationSharpness = 7,
+		yawRateSharpness = 10,
+	},
+
+	lean = {
+		referenceSpeed = 16, -- default WalkSpeed
+		speedLean = math.rad(5), -- posture at referenceSpeed
+		accelLean = 0.35, -- x atan(a / g)
+		bankScale = 0.8, -- x atan(centripetal / g)
+		slopeLean = 0.35, -- x slope angle (uphill -> lean in)
+		maxForward = math.rad(16),
+		maxBackward = math.rad(9),
+		maxBank = math.rad(12),
+		legCompensation = 0.9, -- 1 = legs stay perfectly vertical (bend at the waist)
+		frequency = 2.6, -- spring Hz
+		damping = 0.55, -- < 1 gives a small natural overshoot when stopping
+	},
+
+	terrain = {
+		maxPelvisDrop = 1.2, -- studs; keep < 2 (torso collides with steps beyond)
+		maxFootRaise = 1.5,
+		maxTuck = 0.6, -- leg slides into the torso first (invisible), then bends
+		plantFadeStart = 2.5, -- speed where foot planting starts fading (studs/s)
+		plantFadeEnd = 9, -- fully faded: the walk cycle owns the legs
+		runningDropWeight = 0.55, -- pelvis drop kept while running (stairs down)
+		frequency = 5,
+		damping = 0.9,
+	},
+
+	head = {
+		maxYaw = math.rad(70),
+		maxUp = math.rad(45),
+		maxDown = math.rad(40),
+		backCutoff = math.rad(115), -- target behind the character: relax to neutral
+		torsoShare = 0.3, -- part of the yaw taken by the torso (legs counter-twist)
+		leanCompensation = 0.8, -- keep the gaze level while leaning
+		bankCompensation = 0.7,
+		armPitchShare = 0, -- > 0: arms follow the aim pitch (guns, bows)
+		frequency = 3.2,
+		damping = 1,
+		sendRate = 15, -- Hz, local look replication
+		sendThreshold = math.rad(1),
+	},
+
+	landing = {
+		minImpactSpeed = 22, -- studs/s of downward speed before a visible dip
+		impulseScale = 0.09,
+		maxDip = 1.1,
+		frequency = 3,
+		damping = 0.4,
+	},
+
+	breathing = {
+		rate = 0.22, -- breaths per second
+		torsoAngle = math.rad(1.1),
+		armAngle = math.rad(1.6),
+		idleSpeed = 1.5, -- fades out above this speed
+	},
+}
+
+export type Config = typeof(Config.defaults)
+
+-- Deep-merges `overrides` into a copy of the defaults.
+function Config.resolve(overrides: { [string]: any }?): Config
+	local function merge(base: any, extra: any): any
+		local out = table.clone(base)
+		if extra then
+			for key, value in extra do
+				if type(value) == "table" and type(out[key]) == "table" then
+					out[key] = merge(out[key], value)
+				else
+					out[key] = value
+				end
+			end
+		end
+		return out
+	end
+	return merge(Config.defaults, overrides) :: Config
+end
+
+return Config
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="3">
+        <Properties>
+          <string name="Name">Controller</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Controller (client)
+	Runs the procedural layers on EVERY R6 character this client can see: the local
+	player, other players and tagged NPCs. Each client animates everyone locally from
+	replicated positions, so nothing but head-look angles ever goes over the network.
+
+	Frame loop (RunService.PreSimulation, i.e. after the Animator wrote this frame's pose):
+	  sensing + layers : at a LOD rate (distance / on-screen)
+	  rig:apply()      : every frame (the Animator resets Transform every frame)
+
+	Usage (LocalScript in StarterPlayerScripts):
+		local Controller = require(ReplicatedStorage.R6Procedural.Controller)
+		Controller.start()                                  -- defaults
+		Controller.start({ head = { armPitchShare = 0.5 } }) -- overrides (see Config)
+
+	NPCs: CollectionService:AddTag(npcModel, "R6Procedural"); optional attribute
+	"R6_LookAt" (Vector3 world point) for their head target.
+]]
+
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local R6Procedural = script.Parent
+local Config = require(R6Procedural.Config)
+local LookNet = require(R6Procedural.LookNet)
+local R6Math = require(R6Procedural.R6Math)
+local Rig = require(R6Procedural.Rig)
+local Sensor = require(R6Procedural.Sensor)
+local Types = require(R6Procedural.Types)
+
+local Controller = {}
+
+Controller.TAG = "R6Procedural"
+
+-- Order matters: BodyLean publishes rig.pose, HeadLook consumes it.
+Controller.layers = {
+	require(R6Procedural.Layers.BodyLean),
+	require(R6Procedural.Layers.TerrainAdaptation),
+	require(R6Procedural.Layers.LandingImpact),
+	require(R6Procedural.Layers.HeadLook),
+	require(R6Procedural.Layers.Breathing),
+	require(R6Procedural.Layers.ActionPose), -- combat poses, applied on top of everything
+} :: { Types.Layer }
+
+type Entry = {
+	model: Model,
+	player: Player?,
+	isLocal: boolean,
+	rig: Rig.Rig,
+	sensor: Sensor.Sensor,
+	accumulator: number,
+	enabled: boolean,
+	remoteLook: Types.LookTarget?,
+	weight: (attribute: string) -> number,
+}
+
+local cfg: Config.Config = Config.resolve(nil)
+local entries: { [Model]: Entry } = {}
+local pending: { [Model]: boolean } = {}
+local rayParams = RaycastParams.new()
+local started = false
+local layerFailed: { [string]: boolean } = {}
+
+local localLook: Types.LookTarget? = nil
+local lastSent: Types.LookTarget? = nil
+local sendClock = 0
+local lastSendTime = 0
+local lookRemote: UnreliableRemoteEvent? = nil
+
+local function rebuildRayFilter()
+	local ignore: { Instance } = {}
+	for model in entries do
+		table.insert(ignore, model)
+	end
+	for _, player in Players:GetPlayers() do
+		if player.Character then
+			table.insert(ignore, player.Character)
+		end
+	end
+	local vfx = workspace:FindFirstChild("VFX")
+	if vfx then
+		table.insert(ignore, vfx)
+	end
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = ignore
+	rayParams.IgnoreWater = true
+	rayParams.RespectCanCollide = true
+end
+
+local function untrack(model: Model)
+	local entry = entries[model]
+	if entry then
+		entries[model] = nil
+		if entry.enabled and entry.rig.torso.Parent then
+			entry.rig:restore()
+		end
+		rebuildRayFilter()
+	end
+	pending[model] = nil
+end
+
+local function track(model: Model, player: Player?)
+	if entries[model] or pending[model] then
+		return
+	end
+	pending[model] = true
+	task.spawn(function()
+		-- Parts/joints stream in over a few frames: retry for up to ~10 s.
+		local rig: Rig.Rig? = nil
+		for _ = 1, 40 do
+			if not pending[model] or model.Parent == nil then
+				pending[model] = nil
+				return
+			end
+			rig = Rig.new(model)
+			if rig then
+				break
+			end
+			local humanoid = model:FindFirstChildOfClass("Humanoid")
+			if humanoid and humanoid.RigType ~= Enum.HumanoidRigType.R6 then
+				pending[model] = nil
+				return -- R15: not handled by this system
+			end
+			task.wait(0.25)
+		end
+		pending[model] = nil
+		if rig == nil then
+			return
+		end
+		local entry: Entry = {
+			model = model,
+			player = player,
+			isLocal = player ~= nil and player == Players.LocalPlayer,
+			rig = rig,
+			sensor = Sensor.new(),
+			accumulator = 0,
+			enabled = false,
+			remoteLook = nil,
+			weight = function(attribute: string): number
+				local value = model:GetAttribute(attribute)
+				return if type(value) == "number" then math.clamp(value, 0, 1) else 1
+			end,
+		}
+		entries[model] = entry
+		rebuildRayFilter()
+		model.Destroying:Connect(function()
+			untrack(model)
+		end)
+		model.AncestryChanged:Connect(function(_, parent)
+			if parent == nil then
+				untrack(model)
+			end
+		end)
+	end)
+end
+
+local function trackPlayer(player: Player)
+	if player.Character then
+		track(player.Character, player)
+	end
+	player.CharacterAdded:Connect(function(character)
+		track(character, player)
+	end)
+	player.CharacterRemoving:Connect(function(character)
+		untrack(character)
+	end)
+end
+
+-- LOD sensing interval in seconds, or nil when the character is too far to bother.
+local function lodInterval(entry: Entry, camera: Camera?): number?
+	if entry.isLocal or camera == nil then
+		return 0
+	end
+	local lod = cfg.lod
+	local position = entry.rig.root.Position
+	local distance = (camera.CFrame.Position - position).Magnitude
+	local interval: number
+	if distance <= lod.fullRateDistance then
+		interval = 0
+	elseif distance <= lod.halfRateDistance then
+		interval = 1 / 30
+	elseif distance <= lod.lowRateDistance then
+		interval = 1 / 15
+	else
+		return nil
+	end
+	local _, onScreen = camera:WorldToViewportPoint(position)
+	if not onScreen then
+		interval = math.max(interval, lod.offscreenInterval)
+	end
+	return interval
+end
+
+local function lookTargetFor(entry: Entry, camera: Camera?): Types.LookTarget?
+	local rootCF = entry.rig.root.CFrame
+	if entry.isLocal then
+		if camera == nil then
+			return nil
+		end
+		local yaw, pitch = R6Math.lookAngles(rootCF:VectorToObjectSpace(camera.CFrame.LookVector))
+		localLook = { yaw = yaw, pitch = pitch }
+		return localLook
+	elseif entry.player then
+		return entry.remoteLook
+	end
+	local lookAt = entry.model:GetAttribute("R6_LookAt")
+	if typeof(lookAt) == "Vector3" then
+		local from = if entry.rig.head then entry.rig.head.Position else rootCF.Position
+		local yaw, pitch = R6Math.lookAngles(rootCF:VectorToObjectSpace(lookAt - from))
+		return { yaw = yaw, pitch = pitch }
+	end
+	return nil
+end
+
+local function runLayers(entry: Entry, dt: number, camera: Camera?)
+	local ctx: Types.FrameContext = {
+		isLocal = entry.isLocal,
+		lookTarget = lookTargetFor(entry, camera),
+		weight = entry.weight,
+	}
+	local rig, sensor = entry.rig, entry.sensor
+	rig:begin()
+	for _, layer in Controller.layers do
+		local ok, err = (pcall :: any)(layer.update, rig, sensor, dt, cfg, ctx)
+		if not ok and not layerFailed[layer.name] then
+			layerFailed[layer.name] = true
+			warn(`[R6Procedural] layer {layer.name} failed (reported once):`, err)
+		end
+	end
+end
+
+local function sendLocalLook(dt: number)
+	local remote = lookRemote
+	local look = localLook
+	if remote == nil or look == nil then
+		return
+	end
+	sendClock += dt
+	if sendClock < 1 / cfg.head.sendRate then
+		return
+	end
+	sendClock = 0
+	local now = os.clock()
+	local previous = lastSent
+	local changed = previous == nil
+		or math.abs(previous.yaw - look.yaw) > cfg.head.sendThreshold
+		or math.abs(previous.pitch - look.pitch) > cfg.head.sendThreshold
+	if changed or now - lastSendTime > 1 then
+		remote:FireServer(LookNet.encodeLocal(look.yaw, look.pitch))
+		lastSent = { yaw = look.yaw, pitch = look.pitch }
+		lastSendTime = now
+	end
+end
+
+local function onPreSimulation(dt: number)
+	local camera = workspace.CurrentCamera
+	for model, entry in entries do
+		local rig = entry.rig
+		if not rig:isAlive() then
+			untrack(model)
+			continue
+		end
+		local interval = if model:GetAttribute("R6_Disabled") == true then nil else lodInterval(entry, camera)
+		-- Attacks last a few frames: never throttle a character that is performing an action.
+		local action = model:GetAttribute("R6_Action")
+		if interval and type(action) == "string" and action ~= "" then
+			interval = 0
+		end
+		-- Limited animation ("on twos"): workspace attribute R6_StepFps holds poses between steps.
+		local stepFps = workspace:GetAttribute("R6_StepFps")
+		if interval and type(stepFps) == "number" and stepFps > 0 then
+			interval = math.max(interval, 1 / stepFps)
+		end
+		if interval == nil then
+			if entry.enabled then
+				rig:restore()
+				entry.enabled = false
+			end
+			entry.sensor.lastPosition = nil
+			entry.accumulator = 0
+			continue
+		end
+		entry.enabled = true
+		entry.accumulator += dt
+		local sense = entry.accumulator >= interval
+		if sense then
+			local stepDt = entry.accumulator
+			entry.accumulator = 0
+			Sensor.update(entry.sensor, rig, stepDt, rayParams, cfg, entry.isLocal, true)
+			runLayers(entry, stepDt, camera)
+		end
+		rig:apply()
+	end
+	sendLocalLook(dt)
+end
+
+local function onLookBatch(payload: any)
+	local batch = LookNet.decodeBatch(payload)
+	if batch == nil then
+		return
+	end
+	local me = Players.LocalPlayer
+	for _, item in batch do
+		if me and item.userId == me.UserId then
+			continue
+		end
+		local player = Players:GetPlayerByUserId(item.userId)
+		local character = player and player.Character
+		local entry = character and entries[character]
+		if entry then
+			entry.remoteLook = { yaw = item.yaw, pitch = item.pitch }
+		end
+	end
+end
+
+function Controller.start(overrides: { [string]: any }?)
+	if started then
+		return
+	end
+	started = true
+	cfg = Config.resolve(overrides)
+	rebuildRayFilter()
+
+	for _, player in Players:GetPlayers() do
+		trackPlayer(player)
+	end
+	Players.PlayerAdded:Connect(trackPlayer)
+
+	for _, model in CollectionService:GetTagged(Controller.TAG) do
+		if model:IsA("Model") then
+			track(model, nil)
+		end
+	end
+	CollectionService:GetInstanceAddedSignal(Controller.TAG):Connect(function(model)
+		if model:IsA("Model") then
+			track(model, nil)
+		end
+	end)
+	CollectionService:GetInstanceRemovedSignal(Controller.TAG):Connect(function(model)
+		if model:IsA("Model") and Players:GetPlayerFromCharacter(model) == nil then
+			untrack(model)
+		end
+	end)
+
+	RunService.PreSimulation:Connect(onPreSimulation)
+
+	-- Head-look replication is optional: without the server relay everything else works.
+	task.spawn(function()
+		local remotes = ReplicatedStorage:WaitForChild("R6ProceduralRemotes", 15)
+		local remote = remotes and remotes:FindFirstChild("Look")
+		if remote and remote:IsA("UnreliableRemoteEvent") then
+			lookRemote = remote
+			remote.OnClientEvent:Connect(onLookBatch)
+		end
+	end)
+end
+
+-- Debug / tooling: current entry count and whether a model is being animated.
+function Controller.stats(): (number, number)
+	local total, active = 0, 0
+	for _, entry in entries do
+		total += 1
+		if entry.enabled then
+			active += 1
+		end
+	end
+	return total, active
+end
+
+return Controller
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Folder" referent="4">
+        <Properties>
+          <string name="Name">Layers</string>
+        </Properties>
+        <Item class="ModuleScript" referent="5">
+          <Properties>
+            <string name="Name">ActionPose</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	ActionPose
+	Plays PoseLibrary clips (attacks, blocks, parries, reactions) on top of every other
+	layer, synchronized across clients.
+
+	Replication: the server sets two attributes on the character Model
+	  R6_Action      = clip name ("" / nil = none)
+	  R6_ActionStart = workspace:GetServerTimeNow() when it started
+	  R6_ActionSpeed = playback speed (optional, default 1)
+	Every client samples the clip at (GetServerTimeNow() - start) * speed, so all screens
+	show the same frame. The local player can predict with ActionPose.playLocal(), which
+	wins over the replicated value for the same clip until it ends.
+]]
+
+local R6Procedural = script.Parent.Parent
+local PoseLibrary = require(R6Procedural.PoseLibrary)
+local Rig = require(R6Procedural.Rig)
+local Types = require(R6Procedural.Types)
+
+type Override = { clip: string, start: number, speed: number }
+
+local ActionPose = { name = "ActionPose" } :: Types.Layer & {
+	playLocal: (model: Model, clip: string, speed: number?) -> (),
+	stopLocal: (model: Model) -> (),
+	now: () -> number,
+}
+
+local overrides: { [Model]: Override } = setmetatable({}, { __mode = "k" }) :: any
+
+function ActionPose.now(): number
+	return workspace:GetServerTimeNow()
+end
+
+function ActionPose.playLocal(model: Model, clip: string, speed: number?)
+	overrides[model] = { clip = clip, start = ActionPose.now(), speed = speed or 1 }
+end
+
+function ActionPose.stopLocal(model: Model)
+	overrides[model] = nil
+end
+
+local function pivotFor(rig: Rig.Rig, joint: PoseLibrary.JointName): Vector3
+	if joint == "RootJoint" then
+		return Vector3.new(0, rig.hipLineY, 0)
+	elseif joint == "LeftHip" then
+		return Vector3.new(-rig.hipHalfWidth, rig.hipLineY, 0)
+	elseif joint == "RightHip" then
+		return Vector3.new(rig.hipHalfWidth, rig.hipLineY, 0)
+	end
+	return rig:c0(joint).Position -- Neck, shoulders: the joint itself
+end
+
+local function current(model: Model): (string?, number, number)
+	local now = ActionPose.now()
+	local override = overrides[model]
+	local name = model:GetAttribute("R6_Action")
+	local start = model:GetAttribute("R6_ActionStart")
+	local speed = model:GetAttribute("R6_ActionSpeed")
+	if override then
+		local clip = PoseLibrary.get(override.clip)
+		local elapsed = (now - override.start) * override.speed
+		if clip and (clip.loop or elapsed <= clip.duration) then
+			-- Prediction wins unless the server started something else afterwards.
+			if
+				not (
+					type(name) == "string"
+					and name ~= override.clip
+					and type(start) == "number"
+					and start > override.start
+				)
+			then
+				return override.clip, elapsed, 1
+			end
+		end
+		overrides[model] = nil
+	end
+	if type(name) ~= "string" or name == "" or type(start) ~= "number" then
+		return nil, 0, 0
+	end
+	local s = if type(speed) == "number" then speed else 1
+	return name, (now - start) * s, 1
+end
+
+function ActionPose.update(rig, sensor, _dt, _cfg, ctx)
+	local name, elapsed = current(rig.character)
+	if name == nil then
+		return
+	end
+	local clip = PoseLibrary.get(name)
+	if clip == nil then
+		return
+	end
+	-- Limited animation: snap the clip time to R6_StepFps steps (keys hold, then pop).
+	local stepFps = workspace:GetAttribute("R6_StepFps")
+	if type(stepFps) == "number" and stepFps > 0 then
+		elapsed = math.floor(elapsed * stepFps) / stepFps
+	end
+	local pose, weight = PoseLibrary.sample(clip, elapsed)
+	weight *= ctx.weight("R6_ActionWeight") * math.max(sensor.stateWeight, 0.35)
+	if weight <= 1e-3 then
+		return
+	end
+	for key, entry in pose do
+		local joint: any = key -- pose keys are joint names (validated by PoseLibrary conventions)
+		rig:add(joint, PoseLibrary.jointCFrame(entry, pivotFor(rig, joint), weight))
+	end
+end
+
+return ActionPose
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="6">
+          <Properties>
+            <string name="Name">BodyLean</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	BodyLean
+	Forward/back lean from speed + acceleration, banking into turns, leaning into slopes.
+
+	* Forward lean pivots on the hip line and the hips counter-rotate, so the character
+	  bends at the waist while the legs stay planted (R6 has no spine joint).
+	* Bank pivots on the feet: the whole body tilts into the turn like a runner/bike.
+	* A spring (slightly under-damped) gives the natural overshoot when stopping.
+	Writes rig.pose.lean / rig.pose.bank for the head stabilization in HeadLook.
+]]
+
+local R6Procedural = script.Parent.Parent
+local R6Math = require(R6Procedural.R6Math)
+local Spring = require(R6Procedural.Spring)
+local Types = require(R6Procedural.Types)
+
+local BodyLean = { name = "BodyLean" } :: Types.Layer
+
+function BodyLean.update(rig, sensor, dt, cfg, ctx)
+	local c = cfg.lean
+	local state = rig.layerState.BodyLean
+	if state == nil then
+		state = Spring.new(Vector3.zero, c.frequency, c.damping)
+		rig.layerState.BodyLean = state
+	end
+	local spring = state :: Spring.Spring
+
+	local rootCF = rig.root.CFrame
+	local localVelocity = rootCF:VectorToObjectSpace(Vector3.new(sensor.velocity.X, 0, sensor.velocity.Z))
+	local localAccel = rootCF:VectorToObjectSpace(Vector3.new(sensor.acceleration.X, 0, sensor.acceleration.Z))
+
+	local lean, bank = R6Math.leanAngles(localVelocity, localAccel, sensor.yawRate, workspace.Gravity, c)
+	if sensor.grounded then
+		lean += c.slopeLean * R6Math.slopeLean(sensor.groundNormal)
+	end
+	local weight = sensor.stateWeight * ctx.weight("R6_Lean") * (if sensor.grounded then 1 else 0.4)
+	spring.target = Vector3.new(math.clamp(lean, -c.maxBackward, c.maxForward), bank, 0) * weight
+	local p = spring:update(dt)
+
+	rig.pose.lean = p.X
+	rig.pose.bank = p.Y
+
+	local hipLine = Vector3.new(0, rig.hipLineY, 0)
+	local feet = Vector3.new(0, rig.restFootY, 0)
+	rig:add(
+		"RootJoint",
+		R6Math.rotationAbout(feet, CFrame.Angles(0, 0, p.Y)) * R6Math.rotationAbout(hipLine, CFrame.Angles(-p.X, 0, 0))
+	)
+	local compensation = R6Math.rotationAbout(hipLine, CFrame.Angles(p.X * c.legCompensation, 0, 0))
+	rig:add("LeftHip", compensation)
+	rig:add("RightHip", compensation)
+end
+
+return BodyLean
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="7">
+          <Properties>
+            <string name="Name">Breathing</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	Breathing
+	Subtle idle life: chest rises/falls, arms sway outwards. Fades out when moving.
+	Also the simplest example of a custom layer: copy it to write your own.
+]]
+
+local R6Procedural = script.Parent.Parent
+local R6Math = require(R6Procedural.R6Math)
+local Types = require(R6Procedural.Types)
+
+local Breathing = { name = "Breathing" } :: Types.Layer
+
+function Breathing.update(rig, sensor, dt, cfg, ctx)
+	local c = cfg.breathing
+	local speed = Vector3.new(sensor.velocity.X, 0, sensor.velocity.Z).Magnitude
+	local weight = (1 - R6Math.smoothstep(c.idleSpeed * 0.5, c.idleSpeed, speed))
+		* sensor.stateWeight
+		* ctx.weight("R6_Breathing")
+	local phase = (rig.layerState.BreathingPhase or 0) + dt * c.rate * 2 * math.pi
+	rig.layerState.BreathingPhase = phase % (2 * math.pi)
+	if weight <= 1e-3 then
+		return
+	end
+	local b = math.sin(phase) * weight
+
+	local hipLine = Vector3.new(0, rig.hipLineY, 0)
+	rig:add("RootJoint", R6Math.rotationAbout(hipLine, CFrame.Angles(b * c.torsoAngle, 0, 0)))
+	local counter = R6Math.rotationAbout(hipLine, CFrame.Angles(-b * c.torsoAngle, 0, 0))
+	rig:add("LeftHip", counter)
+	rig:add("RightHip", counter)
+	-- Arms swing slightly outwards on the inhale (+Z rotation moves a hanging hand to +X).
+	local sway = (b * 0.5 + 0.5 * weight) * c.armAngle
+	rig:add("LeftShoulder", R6Math.rotationAbout(rig:c0("LeftShoulder").Position, CFrame.Angles(0, 0, -sway)))
+	rig:add("RightShoulder", R6Math.rotationAbout(rig:c0("RightShoulder").Position, CFrame.Angles(0, 0, sway)))
+end
+
+return Breathing
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="8">
+          <Properties>
+            <string name="Name">HeadLook</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	HeadLook
+	Head (and a share of the torso) turns towards the look target: the camera for the
+	local player, replicated angles for other players, the "R6_LookAt" attribute
+	(Vector3 world point) for NPCs.
+
+	* Targets behind the character relax to neutral instead of snapping to a clamp.
+	* Torso takes `torsoShare` of the yaw; the legs counter-twist so feet stay planted.
+	* The neck compensates the body lean/bank, keeping the gaze level (stabilization).
+]]
+
+local R6Procedural = script.Parent.Parent
+local R6Math = require(R6Procedural.R6Math)
+local Spring = require(R6Procedural.Spring)
+local Types = require(R6Procedural.Types)
+
+local HeadLook = { name = "HeadLook" } :: Types.Layer
+
+function HeadLook.update(rig, sensor, dt, cfg, ctx)
+	local c = cfg.head
+	local state = rig.layerState.HeadLook
+	if state == nil then
+		state = Spring.new(Vector3.zero, c.frequency, c.damping)
+		rig.layerState.HeadLook = state
+	end
+	local spring = state :: Spring.Spring
+
+	local yaw, pitch = 0, 0
+	local target = ctx.lookTarget
+	if target then
+		yaw, pitch = target.yaw, target.pitch
+		if math.abs(yaw) > c.backCutoff then
+			yaw, pitch = 0, 0
+		end
+		yaw = math.clamp(yaw, -c.maxYaw, c.maxYaw)
+		pitch = math.clamp(pitch, -c.maxDown, c.maxUp)
+	end
+	local weight = sensor.stateWeight * ctx.weight("R6_HeadLook")
+	spring.target = Vector3.new(yaw, pitch, 0) * weight
+	local p = spring:update(dt)
+	local smoothYaw, smoothPitch = p.X, p.Y
+
+	local torsoYaw = smoothYaw * c.torsoShare
+	if math.abs(torsoYaw) > 1e-4 then
+		rig:add("RootJoint", CFrame.Angles(0, torsoYaw, 0))
+		local counter = R6Math.rotationAbout(Vector3.new(0, rig.hipLineY, 0), CFrame.Angles(0, -torsoYaw, 0))
+		rig:add("LeftHip", counter)
+		rig:add("RightHip", counter)
+	end
+
+	local neckPitch = smoothPitch + rig.pose.lean * c.leanCompensation
+	local neckRoll = -rig.pose.bank * c.bankCompensation
+	local neckPivot = rig:c0("Neck").Position
+	rig:add(
+		"Neck",
+		R6Math.rotationAbout(neckPivot, CFrame.fromEulerAnglesYXZ(neckPitch, smoothYaw - torsoYaw, neckRoll))
+	)
+
+	if c.armPitchShare > 0 then
+		local armPitch = smoothPitch * c.armPitchShare
+		rig:add("LeftShoulder", R6Math.rotationAbout(rig:c0("LeftShoulder").Position, CFrame.Angles(armPitch, 0, 0)))
+		rig:add("RightShoulder", R6Math.rotationAbout(rig:c0("RightShoulder").Position, CFrame.Angles(armPitch, 0, 0)))
+	end
+end
+
+return HeadLook
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="9">
+          <Properties>
+            <string name="Name">LandingImpact</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	LandingImpact
+	Crouch-and-recover on landing, proportional to the fall speed: the pelvis dips on a
+	bouncy spring while the legs tuck by the same amount, so the feet stay on the floor
+	(reads as bent knees on a knee-less rig). Works for every character (derived from
+	position history, no Humanoid state needed).
+]]
+
+local R6Procedural = script.Parent.Parent
+local R6Math = require(R6Procedural.R6Math)
+local Spring = require(R6Procedural.Spring)
+local Types = require(R6Procedural.Types)
+
+local LandingImpact = { name = "LandingImpact" } :: Types.Layer
+
+function LandingImpact.update(rig, sensor, dt, cfg, ctx)
+	local c = cfg.landing
+	local state = rig.layerState.LandingImpact
+	if state == nil then
+		state = Spring.new(Vector3.zero, c.frequency, c.damping)
+		rig.layerState.LandingImpact = state
+	end
+	local spring = state :: Spring.Spring
+
+	if sensor.landingImpact > c.minImpactSpeed then
+		local strength = (sensor.landingImpact - c.minImpactSpeed) * c.impulseScale
+		spring:impulse(Vector3.new(strength * 12 * ctx.weight("R6_Landing") * sensor.stateWeight, 0, 0))
+	end
+	local dip = math.clamp(spring:update(dt).X, 0, c.maxDip)
+	if dip <= 1e-3 then
+		return
+	end
+	local hipLine = Vector3.new(0, rig.hipLineY, 0)
+	rig:add("RootJoint", CFrame.new(0, -dip, 0) * R6Math.rotationAbout(hipLine, CFrame.Angles(-dip * 0.25, 0, 0)))
+	local tuck = CFrame.new(0, dip, 0) * R6Math.rotationAbout(hipLine, CFrame.Angles(dip * 0.25, 0, 0))
+	rig:add("LeftHip", tuck)
+	rig:add("RightHip", tuck)
+end
+
+return LandingImpact
+]]></string>
+          </Properties>
+        </Item>
+        <Item class="ModuleScript" referent="10">
+          <Properties>
+            <string name="Name">TerrainAdaptation</string>
+            <string name="Source"><![CDATA[--!strict
+--[[
+	TerrainAdaptation
+	Foot planting for rigid R6 legs on stairs, rocks and slopes.
+
+	1. Pelvis drop: the Humanoid stands on the HIGHEST point under its hitbox, so on a
+	   stair edge one foot floats. The whole body is lowered until the lowest foot
+	   touches its ground.
+	2. Foot raise: the other foot, now clipping, is lifted by tucking the leg into the
+	   torso (hidden on R6) and then bending it forward at the hip.
+	Planting fades out with speed (the walk cycle owns the legs while running); the
+	pelvis drop is partially kept so running down stairs still hugs the steps.
+]]
+
+local R6Procedural = script.Parent.Parent
+local R6Math = require(R6Procedural.R6Math)
+local Spring = require(R6Procedural.Spring)
+local Types = require(R6Procedural.Types)
+
+local TerrainAdaptation = { name = "TerrainAdaptation" } :: Types.Layer
+
+function TerrainAdaptation.update(rig, sensor, dt, cfg, ctx)
+	local c = cfg.terrain
+	local state = rig.layerState.TerrainAdaptation
+	if state == nil then
+		state = Spring.new(Vector3.zero, c.frequency, c.damping)
+		rig.layerState.TerrainAdaptation = state
+	end
+	local spring = state :: Spring.Spring
+
+	local speed = Vector3.new(sensor.velocity.X, 0, sensor.velocity.Z).Magnitude
+	local moving = R6Math.smoothstep(c.plantFadeStart, c.plantFadeEnd, speed)
+	local base = sensor.stateWeight * ctx.weight("R6_Terrain") * (if sensor.grounded then 1 else 0)
+	local plantWeight = base * (1 - moving)
+	local dropWeight = base * (1 - moving * (1 - c.runningDropWeight))
+
+	local drop, raiseL, raiseR = R6Math.solveFeet(sensor.leftError, sensor.rightError, c.maxPelvisDrop, c.maxFootRaise)
+	spring.target = Vector3.new(drop * dropWeight, raiseL * plantWeight, raiseR * plantWeight)
+	local p = spring:update(dt)
+	local d = math.max(p.X, 0)
+
+	if d > 1e-3 then
+		rig:add("RootJoint", CFrame.new(0, -d, 0))
+	end
+	local hipPivot = Vector3.new(0, rig.hipLineY, 0)
+	local function raiseLeg(joint: "LeftHip" | "RightHip", raise: number)
+		if raise <= 1e-3 then
+			return
+		end
+		local tuck, angle = R6Math.legRaise(raise, rig.legLength, c.maxTuck)
+		rig:add(joint, CFrame.new(0, tuck, 0) * R6Math.rotationAbout(hipPivot, CFrame.Angles(angle, 0, 0)))
+	end
+	raiseLeg("LeftHip", p.Y)
+	raiseLeg("RightHip", p.Z)
+end
+
+return TerrainAdaptation
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+      <Item class="ModuleScript" referent="11">
+        <Properties>
+          <string name="Name">LookNet</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	LookNet
+	Wire format for head-look replication (Motor6D/Transform changes made on a client
+	never replicate, so the look angles are sent explicitly).
+
+	client -> server : 4 bytes   i16 yaw, i16 pitch                (rate-limited, 15 Hz)
+	server -> clients: 1 + 12*n  u8 count, then n x (f64 userId, i16 yaw, i16 pitch)
+	                   batched at 15 Hz, <= 70 players per packet (841 bytes < 900).
+	Angles are quantized to pi/32767 (~0.0055 deg).
+]]
+
+local LookNet = {}
+
+LookNet.LOCAL_SIZE = 4
+LookNet.ENTRY_SIZE = 12
+LookNet.MAX_ENTRIES = 70
+
+export type Entry = { userId: number, yaw: number, pitch: number }
+
+local SCALE = 32767 / math.pi
+
+local function quantize(angle: number): number
+	if angle ~= angle then -- NaN
+		return 0
+	end
+	return math.clamp(math.round(angle * SCALE), -32767, 32767)
+end
+
+function LookNet.encodeLocal(yaw: number, pitch: number): buffer
+	local b = buffer.create(LookNet.LOCAL_SIZE)
+	buffer.writei16(b, 0, quantize(yaw))
+	buffer.writei16(b, 2, quantize(pitch))
+	return b
+end
+
+function LookNet.decodeLocal(b: any): (number?, number?)
+	if typeof(b) ~= "buffer" or buffer.len(b) ~= LookNet.LOCAL_SIZE then
+		return nil, nil
+	end
+	return buffer.readi16(b, 0) / SCALE, buffer.readi16(b, 2) / SCALE
+end
+
+function LookNet.encodeBatch(entries: { Entry }): buffer
+	local count = math.min(#entries, LookNet.MAX_ENTRIES)
+	local b = buffer.create(1 + count * LookNet.ENTRY_SIZE)
+	buffer.writeu8(b, 0, count)
+	for i = 1, count do
+		local e = entries[i]
+		local offset = 1 + (i - 1) * LookNet.ENTRY_SIZE
+		buffer.writef64(b, offset, e.userId)
+		buffer.writei16(b, offset + 8, quantize(e.yaw))
+		buffer.writei16(b, offset + 10, quantize(e.pitch))
+	end
+	return b
+end
+
+function LookNet.decodeBatch(b: any): { Entry }?
+	if typeof(b) ~= "buffer" or buffer.len(b) < 1 then
+		return nil
+	end
+	local count = buffer.readu8(b, 0)
+	if count > LookNet.MAX_ENTRIES or buffer.len(b) ~= 1 + count * LookNet.ENTRY_SIZE then
+		return nil
+	end
+	local entries = table.create(count)
+	for i = 1, count do
+		local offset = 1 + (i - 1) * LookNet.ENTRY_SIZE
+		entries[i] = {
+			userId = buffer.readf64(b, offset),
+			yaw = buffer.readi16(b, offset + 8) / SCALE,
+			pitch = buffer.readi16(b, offset + 10) / SCALE,
+		}
+	end
+	return entries
+end
+
+return LookNet
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="12">
+        <Properties>
+          <string name="Name">PoseLibrary</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	PoseLibrary
+	Keyframed procedural poses for R6 (combat moves, reactions) with ZERO animation assets.
+
+	A pose = per-joint rotation (degrees, Part0 space, applied about the joint's natural
+	pivot) + optional translation (studs, Part0 space). Conventions (tested):
+	  * Shoulders / hips:  X+ swings the limb FORWARD (90 = pointing forward, 170 = overhead),
+	                       Z+ moves the hand towards +X (right arm: outwards, left arm: inwards).
+	  * RootJoint (torso): X+ leans BACK, Y+ twists LEFT, Z+ tilts LEFT. Pivot: hip line.
+	  * Neck:              X+ looks up, Y+ looks left.
+	Clips are sampled with world/server time so every client shows the same frame.
+
+	Attack clips are generated from the move timings (windup / active / recovery), so the
+	visible strike ALWAYS matches the server hitbox window.
+]]
+
+local R6Math = require(script.Parent.R6Math)
+
+export type JointName = "RootJoint" | "Neck" | "LeftHip" | "RightHip" | "LeftShoulder" | "RightShoulder"
+export type JointPose = { rot: Vector3, pos: Vector3? }
+export type Pose = { [string]: JointPose }
+export type Keyframe = { t: number, pose: Pose, ease: ((number) -> number)? }
+export type Clip = {
+	duration: number,
+	keys: { Keyframe },
+	blendIn: number,
+	blendOut: number,
+	loop: boolean?,
+}
+
+local PoseLibrary = {}
+
+local function outQuad(t: number): number
+	return 1 - (1 - t) * (1 - t)
+end
+local function outExpo(t: number): number
+	return if t >= 1 then 1 else 1 - 2 ^ (-10 * t)
+end
+local function inOutSine(t: number): number
+	return -(math.cos(math.pi * t) - 1) / 2
+end
+local function inQuad(t: number): number
+	return t * t
+end
+PoseLibrary.ease = { outQuad = outQuad, outExpo = outExpo, inOutSine = inOutSine, inQuad = inQuad }
+
+local NEUTRAL: Pose = {}
+PoseLibrary.NEUTRAL = NEUTRAL
+
+local JOINTS: { JointName } = { "RootJoint", "Neck", "LeftHip", "RightHip", "LeftShoulder", "RightShoulder" }
+PoseLibrary.JOINTS = JOINTS
+
+local function jp(x: number, y: number, z: number, pos: Vector3?): JointPose
+	return { rot = Vector3.new(x, y, z), pos = pos }
+end
+PoseLibrary.jp = jp
+
+-- Linear blend of two poses (missing joints = neutral).
+function PoseLibrary.blend(a: Pose, b: Pose, t: number): Pose
+	local out: Pose = {}
+	for _, name in JOINTS do
+		local joint = name
+		local ja, jb = a[joint], b[joint]
+		if ja or jb then
+			local ra = if ja then ja.rot else Vector3.zero
+			local rb = if jb then jb.rot else Vector3.zero
+			local pa = if ja and ja.pos then ja.pos else Vector3.zero
+			local pb = if jb and jb.pos then jb.pos else Vector3.zero
+			out[joint] = { rot = ra:Lerp(rb, t), pos = pa:Lerp(pb, t) }
+		end
+	end
+	return out
+end
+
+-- Samples a clip at `time` seconds. Returns the pose and the blend weight (0..1).
+function PoseLibrary.sample(clip: Clip, time: number): (Pose, number)
+	local duration = clip.duration
+	if clip.loop then
+		time %= duration
+	elseif time < 0 or time > duration then
+		return NEUTRAL, 0
+	end
+	local keys = clip.keys
+	local pose: Pose = keys[1].pose
+	for i = 1, #keys - 1 do
+		local a, b = keys[i], keys[i + 1]
+		if time >= a.t and time <= b.t then
+			local span = b.t - a.t
+			local k = if span > 0 then (time - a.t) / span else 1
+			local ease = b.ease or inOutSine
+			pose = PoseLibrary.blend(a.pose, b.pose, ease(k))
+			break
+		elseif i == #keys - 1 then
+			pose = b.pose
+		end
+	end
+	local weight = 1
+	if not clip.loop then
+		if clip.blendIn > 0 then
+			weight = math.min(weight, time / clip.blendIn)
+		end
+		if clip.blendOut > 0 then
+			weight = math.min(weight, (duration - time) / clip.blendOut)
+		end
+	end
+	return pose, math.clamp(weight, 0, 1)
+end
+
+--[[
+	Part0-space offset CFrame of one joint for a pose entry, rotating about the joint's
+	natural pivot. `pivot` comes from the rig (hip line for torso/hips, C0 position for
+	neck/shoulders).
+]]
+function PoseLibrary.jointCFrame(entry: JointPose, pivot: Vector3, weight: number): CFrame
+	local r = entry.rot * (math.pi / 180 * weight)
+	local rotation = CFrame.fromEulerAnglesYXZ(r.X, r.Y, r.Z)
+	local offset = R6Math.rotationAbout(pivot, rotation)
+	if entry.pos then
+		offset = CFrame.new(entry.pos * weight) * offset
+	end
+	return offset
+end
+
+export type AttackPoses = { windup: Pose, strike: Pose, follow: Pose? }
+export type Timing = { windup: number, active: number, recovery: number }
+
+--[[
+	Builds an attack clip whose keys line up with gameplay timings:
+	  0 -> windup      : neutral -> windup pose (anticipation, easeOut)
+	  windup -> +active : windup -> strike pose (explosive, outExpo) = hitbox window
+	  -> +recovery      : strike -> follow-through -> neutral
+]]
+function PoseLibrary.attack(poses: AttackPoses, timing: Timing): Clip
+	local t1 = timing.windup
+	local t2 = t1 + timing.active
+	local t3 = t2 + timing.recovery
+	local follow = poses.follow or poses.strike
+	return {
+		duration = t3,
+		blendIn = math.min(0.06, t1),
+		blendOut = math.min(0.12, timing.recovery),
+		keys = {
+			{ t = 0, pose = NEUTRAL },
+			{ t = t1, pose = poses.windup, ease = outQuad },
+			{ t = t2, pose = poses.strike, ease = outExpo },
+			{ t = t2 + timing.recovery * 0.45, pose = follow, ease = outQuad },
+			{ t = t3, pose = NEUTRAL, ease = inOutSine },
+		},
+	}
+end
+
+-- Held pose (block stance, idle guard): short blend in, loops until the action changes.
+function PoseLibrary.hold(pose: Pose, blendIn: number): Clip
+	return {
+		duration = 1,
+		blendIn = blendIn,
+		blendOut = 0,
+		loop = true,
+		keys = { { t = 0, pose = pose }, { t = 1, pose = pose } },
+	}
+end
+
+-- One-shot reaction: snap to `pose` then recover over `duration`.
+function PoseLibrary.reaction(pose: Pose, snap: number, duration: number): Clip
+	return {
+		duration = duration,
+		blendIn = 0,
+		blendOut = duration * 0.4,
+		keys = {
+			{ t = 0, pose = NEUTRAL },
+			{ t = snap, pose = pose, ease = outExpo },
+			{ t = duration, pose = NEUTRAL, ease = inOutSine },
+		},
+	}
+end
+
+------------------------------------------------------------------------------------
+-- Clip registry (combat code registers its own clips; defaults below are ready to use)
+------------------------------------------------------------------------------------
+
+local clips: { [string]: Clip } = {}
+
+function PoseLibrary.register(name: string, clip: Clip)
+	clips[name] = clip
+end
+
+function PoseLibrary.get(name: string): Clip?
+	return clips[name]
+end
+
+-- Generic reactions / stances (weapon-agnostic).
+PoseLibrary.register(
+	"Stagger",
+	PoseLibrary.reaction({
+		RootJoint = jp(14, 0, -6),
+		Neck = jp(18, 8, 0),
+		RightShoulder = jp(-15, 0, 20),
+		LeftShoulder = jp(-15, 0, -20),
+	}, 0.06, 0.45)
+)
+PoseLibrary.register(
+	"GuardBroken",
+	PoseLibrary.reaction({
+		RootJoint = jp(24, 0, 0, Vector3.new(0, -0.3, 0)),
+		Neck = jp(25, 0, 0),
+		RightShoulder = jp(40, 0, 70),
+		LeftShoulder = jp(40, 0, -70),
+		LeftHip = jp(-18, 0, 0),
+		RightHip = jp(10, 0, 0),
+	}, 0.08, 1.1)
+)
+PoseLibrary.register(
+	"Parried", -- attacker recoil after being parried
+	PoseLibrary.reaction({
+		RootJoint = jp(16, -12, 0),
+		RightShoulder = jp(150, 0, 35),
+		Neck = jp(12, 0, 0),
+	}, 0.07, 0.6)
+)
+PoseLibrary.register(
+	"DodgeLeft",
+	PoseLibrary.reaction({
+		RootJoint = jp(-10, 0, 22, Vector3.new(0, -0.6, 0)),
+		LeftHip = jp(20, 0, -15),
+		RightHip = jp(-10, 0, 25),
+		LeftShoulder = jp(30, 0, -40),
+		RightShoulder = jp(-20, 0, 30),
+	}, 0.08, 0.4)
+)
+PoseLibrary.register(
+	"DodgeRight",
+	PoseLibrary.reaction({
+		RootJoint = jp(-10, 0, -22, Vector3.new(0, -0.6, 0)),
+		RightHip = jp(20, 0, 15),
+		LeftHip = jp(-10, 0, -25),
+		RightShoulder = jp(30, 0, 40),
+		LeftShoulder = jp(-20, 0, -30),
+	}, 0.08, 0.4)
+)
+PoseLibrary.register(
+	"DodgeBack",
+	PoseLibrary.reaction({
+		RootJoint = jp(-16, 0, 0, Vector3.new(0, -0.7, 0)),
+		LeftHip = jp(35, 0, 0),
+		RightHip = jp(-25, 0, 0),
+		LeftShoulder = jp(40, 0, -15),
+		RightShoulder = jp(40, 0, 15),
+	}, 0.08, 0.4)
+)
+
+return PoseLibrary
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="13">
+        <Properties>
+          <string name="Name">R6Math</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	R6Math
+	Pure math for procedural R6 motion. No services: unit-tested under Lune against the
+	real R6 joint constants.
+
+	THE key rule (read r6_motor6d_math.md):
+	  Part1.CFrame = Part0.CFrame * C0 * Transform * C1:Inverse()
+	  Every procedural offset in this library is written in PART0 SPACE (e.g. "move the
+	  torso down in HumanoidRootPart space", "rotate the head about the neck point in
+	  Torso space") and converted once with jointOffset(). Offsets written directly in
+	  C0's frame are what broke the legacy script: RootJoint.C0's local Y axis points
+	  BACKWARDS and its local Z axis points UP.
+]]
+
+local R6Math = {}
+
+-- Default R6 joints (Part0-space C0 / Part1-space C1), for reference and tests.
+R6Math.DEFAULT_C0 = {
+	RootJoint = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+	Neck = CFrame.new(0, 1, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+	RightHip = CFrame.new(1, -1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+	LeftHip = CFrame.new(-1, -1, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+	RightShoulder = CFrame.new(1, 0.5, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+	LeftShoulder = CFrame.new(-1, 0.5, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+}
+R6Math.DEFAULT_C1 = {
+	RootJoint = CFrame.new(0, 0, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+	Neck = CFrame.new(0, -0.5, 0, -1, 0, 0, 0, 0, 1, 0, 1, 0),
+	RightHip = CFrame.new(0.5, 1, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+	LeftHip = CFrame.new(-0.5, 1, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+	RightShoulder = CFrame.new(-0.5, 0.5, 0, 0, 0, 1, 0, 1, 0, -1, 0, 0),
+	LeftShoulder = CFrame.new(0.5, 0.5, 0, 0, 0, -1, 0, 1, 0, 1, 0, 0),
+}
+
+--[[
+	Converts an offset expressed in Part0 space into the pre-multiplier for Transform:
+	  Part0 * offset * C0 * T * C1^-1  ==  Part0 * C0 * (jointOffset(C0, offset) * T) * C1^-1
+	so `joint.Transform = jointOffset(c0, offset) * animatedTransform` layers the offset
+	on top of whatever the Animator produced this frame.
+]]
+function R6Math.jointOffset(c0: CFrame, part0Offset: CFrame): CFrame
+	return c0:Inverse() * part0Offset * c0
+end
+
+-- Rotation `rotation` (in Part0 axes) about the Part0-space point `pivot`.
+function R6Math.rotationAbout(pivot: Vector3, rotation: CFrame): CFrame
+	return CFrame.new(pivot) * rotation * CFrame.new(-pivot)
+end
+
+--[[
+	Yaw/pitch of a direction expressed in the character root's space.
+	yaw  > 0 : target is to the LEFT  (rotation about +Y)
+	pitch > 0: target is ABOVE        (rotation about +X)
+	Use them as CFrame.fromEulerAnglesYXZ(pitch, yaw, 0) to aim a -Z facing part.
+]]
+function R6Math.lookAngles(localDirection: Vector3): (number, number)
+	if localDirection.Magnitude < 1e-6 then
+		return 0, 0
+	end
+	local d = localDirection.Unit
+	return math.atan2(-d.X, -d.Z), math.asin(math.clamp(d.Y, -1, 1))
+end
+
+--[[
+	Foot planting solver for rigid (knee-less) R6 legs.
+
+	leftError / rightError: ground height under each foot minus the resting foot height
+	(both in root space). > 0: ground above the foot (would clip). < 0: foot floats.
+	nil: no ground found under that foot (ledge) -> treated as "no adjustment".
+
+	Returns:
+	  drop  >= 0 : lower the whole body (RootJoint) so the lowest foot touches down;
+	  raiseL/R >= 0 : then lift each foot by this much (tuck + hip bend).
+]]
+function R6Math.solveFeet(
+	leftError: number?,
+	rightError: number?,
+	maxDrop: number,
+	maxRaise: number
+): (number, number, number)
+	local eL = leftError or 0
+	local eR = rightError or 0
+	local drop = math.clamp(-math.min(eL, eR, 0), 0, maxDrop)
+	local raiseL = math.clamp(eL + drop, 0, maxRaise)
+	local raiseR = math.clamp(eR + drop, 0, maxRaise)
+	return drop, raiseL, raiseR
+end
+
+--[[
+	How to lift a rigid leg by `raise` studs:
+	  1. tuck: slide the leg up into the torso (invisible on R6: same depth, hidden inside
+	     the torso volume) up to `maxTuck`;
+	  2. bend: swing the leg forward about the hip by `angle`, which lifts the foot by
+	     legLength * (1 - cos(angle)).
+	Returns (tuck, angle). Apply as CFrame.new(0, tuck, 0) * rotationAbout(hip, Angles(angle, 0, 0)).
+]]
+function R6Math.legRaise(raise: number, legLength: number, maxTuck: number): (number, number)
+	local tuck = math.clamp(raise, 0, maxTuck)
+	local rest = math.max(raise - tuck, 0)
+	local angle = math.acos(math.clamp(1 - rest / legLength, -1, 1))
+	return tuck, angle
+end
+
+export type LeanSettings = {
+	referenceSpeed: number, -- speed (studs/s) that produces `speedLean`
+	speedLean: number, -- radians of forward lean at referenceSpeed
+	accelLean: number, -- multiplier on atan(acceleration / gravity)
+	bankScale: number, -- multiplier on atan(centripetal acceleration / gravity)
+	maxForward: number,
+	maxBackward: number,
+	maxBank: number,
+}
+
+--[[
+	Physically-inspired lean targets.
+	  forward lean = speed posture + atan(a_forward / g)   (accelerate -> lean in, brake -> lean back)
+	  bank         = atan(yawRate * speed / g)             (a motorcycle's lean angle in a turn)
+	localVelocity / localAcceleration are in root space (-Z = forward).
+	yawRate > 0 when turning left. Returns (forwardLean > 0 = forward, bank > 0 = left).
+]]
+function R6Math.leanAngles(
+	localVelocity: Vector3,
+	localAcceleration: Vector3,
+	yawRate: number,
+	gravity: number,
+	s: LeanSettings
+): (number, number)
+	local forwardSpeed = -localVelocity.Z
+	local horizontalSpeed = Vector3.new(localVelocity.X, 0, localVelocity.Z).Magnitude
+	local forwardAccel = -localAcceleration.Z
+	local g = math.max(gravity, 1)
+
+	local lean = s.speedLean * math.clamp(forwardSpeed / math.max(s.referenceSpeed, 1e-3), -1, 1.5)
+		+ s.accelLean * math.atan(forwardAccel / g)
+	local bank = s.bankScale * math.atan(yawRate * horizontalSpeed / g)
+
+	return math.clamp(lean, -s.maxBackward, s.maxForward), math.clamp(bank, -s.maxBank, s.maxBank)
+end
+
+-- Forward lean that matches the slope ahead (uphill -> lean in). normal in root space.
+function R6Math.slopeLean(localNormal: Vector3): number
+	return math.asin(math.clamp(localNormal.Z, -1, 1))
+end
+
+-- Signed yaw change (radians) between two horizontal look vectors (+ = turned left).
+function R6Math.yawDelta(previousLook: Vector3, currentLook: Vector3): number
+	local a = Vector3.new(previousLook.X, 0, previousLook.Z)
+	local b = Vector3.new(currentLook.X, 0, currentLook.Z)
+	if a.Magnitude < 1e-6 or b.Magnitude < 1e-6 then
+		return 0
+	end
+	a, b = a.Unit, b.Unit
+	return math.atan2(a:Cross(b).Y, a:Dot(b))
+end
+
+function R6Math.smoothstep(edge0: number, edge1: number, x: number): number
+	local t = math.clamp((x - edge0) / (edge1 - edge0), 0, 1)
+	return t * t * (3 - 2 * t)
+end
+
+-- Frame-rate independent exponential smoothing factor.
+function R6Math.expAlpha(sharpness: number, dt: number): number
+	return 1 - math.exp(-sharpness * dt)
+end
+
+return R6Math
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="14">
+        <Properties>
+          <string name="Name">Rig</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Rig
+	Finds the six R6 joints and layers procedural offsets on top of the animation.
+
+	How offsets are written (the officially recommended layering, see Motor6D/
+	AnimationConstraint docs): every frame, in RunService.PreSimulation, AFTER the
+	Animator wrote its pose,
+	    joint.Transform = jointOffset(C0, part0Offset) * animatedTransform
+	Advantages over writing C0:
+	  * stacks with any animation instead of fighting it;
+	  * works for Motor6D AND AnimationConstraint (Avatar Joint Upgrade) joints;
+	  * nothing to "restore": the Animator rewrites Transform next frame.
+
+	Robustness: when the Animator did NOT rewrite Transform this frame (no track on that
+	joint, Animator.EvaluationThrottled, far LOD) we detect our own last write and
+	re-apply on the stored base, so offsets never accumulate.
+]]
+
+local R6Math = require(script.Parent.R6Math)
+
+export type JointName = "RootJoint" | "Neck" | "LeftHip" | "RightHip" | "LeftShoulder" | "RightShoulder"
+
+type JointInstance = Motor6D | AnimationConstraint
+
+type JointState = {
+	instance: JointInstance,
+	offset: CFrame, -- accumulated Part0-space offset for this frame
+	lastWritten: CFrame?,
+	lastBase: CFrame?,
+}
+
+export type Pose = {
+	lean: number, -- current forward lean (rad), shared between layers
+	bank: number,
+}
+
+export type Rig = {
+	character: Model,
+	humanoid: Humanoid,
+	root: BasePart,
+	torso: BasePart,
+	head: BasePart?,
+	joints: { [JointName]: JointState },
+	pose: Pose,
+	layerState: { [string]: any },
+	-- Geometry (read from the actual parts: scaled rigs work).
+	legLength: number,
+	restFootY: number, -- resting foot height relative to the root center (negative)
+	hipLineY: number, -- torso-space Y of the hip line (bottom of the torso)
+	hipHalfWidth: number, -- torso-space X of each leg's center line
+
+	begin: (self: Rig) -> (),
+	add: (self: Rig, joint: JointName, part0Offset: CFrame) -> (),
+	apply: (self: Rig) -> (),
+	restore: (self: Rig) -> (),
+	isAlive: (self: Rig) -> boolean,
+	c0: (self: Rig, joint: JointName) -> CFrame,
+}
+
+local Rig = {}
+Rig.__index = Rig
+
+local JOINT_LOOKUP: { [JointName]: { part: string, name: string } } = {
+	RootJoint = { part = "HumanoidRootPart", name = "RootJoint" },
+	Neck = { part = "Torso", name = "Neck" },
+	LeftHip = { part = "Torso", name = "Left Hip" },
+	RightHip = { part = "Torso", name = "Right Hip" },
+	LeftShoulder = { part = "Torso", name = "Left Shoulder" },
+	RightShoulder = { part = "Torso", name = "Right Shoulder" },
+}
+
+local IDENTITY = CFrame.new()
+
+local function asJoint(inst: Instance?): JointInstance?
+	if inst == nil then
+		return nil
+	elseif inst:IsA("Motor6D") then
+		return inst
+	elseif inst:IsA("AnimationConstraint") then
+		return inst
+	end
+	return nil
+end
+
+local function findJoint(character: Model, partName: string, jointName: string): JointInstance?
+	local part = character:FindFirstChild(partName)
+	local direct = asJoint(part and part:FindFirstChild(jointName))
+	if direct then
+		return direct
+	end
+	-- AnimationConstraints may live elsewhere in the model.
+	for _, descendant in character:GetDescendants() do
+		if descendant.Name == jointName then
+			local joint = asJoint(descendant)
+			if joint then
+				return joint
+			end
+		end
+	end
+	return nil
+end
+
+local function getC0(joint: JointInstance): CFrame
+	if joint:IsA("Motor6D") then
+		return joint.C0
+	end
+	local constraint = joint :: AnimationConstraint
+	local attachment = constraint.Attachment0
+	return if attachment then attachment.CFrame else IDENTITY
+end
+
+local function getTransform(joint: JointInstance): CFrame
+	if joint:IsA("Motor6D") then
+		return joint.Transform
+	end
+	return (joint :: AnimationConstraint).Transform
+end
+
+local function setTransform(joint: JointInstance, value: CFrame)
+	if joint:IsA("Motor6D") then
+		joint.Transform = value
+	else
+		(joint :: AnimationConstraint).Transform = value
+	end
+end
+
+local function same(a: CFrame, b: CFrame): boolean
+	return a.Position:FuzzyEq(b.Position, 1e-5)
+		and a.XVector:FuzzyEq(b.XVector, 1e-5)
+		and a.YVector:FuzzyEq(b.YVector, 1e-5)
+end
+
+local function isIdentity(cf: CFrame): boolean
+	return same(cf, IDENTITY)
+end
+
+-- Returns nil when the model is not a complete R6 rig (yet).
+function Rig.new(character: Model): Rig?
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	local torso = character:FindFirstChild("Torso")
+	if humanoid == nil or humanoid.RigType ~= Enum.HumanoidRigType.R6 then
+		return nil
+	end
+	if root == nil or not root:IsA("BasePart") or torso == nil or not torso:IsA("BasePart") then
+		return nil
+	end
+	local joints = {} :: { [JointName]: JointState }
+	for name, where in JOINT_LOOKUP do
+		local joint = findJoint(character, where.part, where.name)
+		if joint == nil then
+			return nil
+		end
+		joints[name :: JointName] = { instance = joint, offset = IDENTITY, lastWritten = nil, lastBase = nil }
+	end
+
+	local leg = character:FindFirstChild("Left Leg")
+	local legLength = if leg and leg:IsA("BasePart") then leg.Size.Y else 2
+	local head = character:FindFirstChild("Head")
+
+	local self = setmetatable({
+		character = character,
+		humanoid = humanoid,
+		root = root,
+		torso = torso,
+		head = if head and head:IsA("BasePart") then head else nil,
+		joints = joints,
+		pose = { lean = 0, bank = 0 },
+		layerState = {},
+		legLength = legLength,
+		-- Humanoid docs (R6): Height = LeftLeg.Size.Y + 0.5 * RootPart.Size.Y + HipHeight
+		restFootY = -(legLength + 0.5 * root.Size.Y + humanoid.HipHeight),
+		hipLineY = -0.5 * torso.Size.Y,
+		hipHalfWidth = 0.25 * torso.Size.X,
+	}, Rig)
+	return (self :: any) :: Rig
+end
+
+function Rig.c0(self: Rig, joint: JointName): CFrame
+	return getC0(self.joints[joint].instance)
+end
+
+-- Clears this frame's offsets (called before the layers run).
+function Rig.begin(self: Rig)
+	for _, joint in self.joints do
+		joint.offset = IDENTITY
+	end
+end
+
+-- Adds a Part0-space offset (later layers are applied on the outside).
+function Rig.add(self: Rig, joint: JointName, part0Offset: CFrame)
+	local state = self.joints[joint]
+	state.offset = part0Offset * state.offset
+end
+
+-- Writes Transform for every joint. Must run every frame (PreSimulation), even on
+-- frames where the layers did not re-sense, because the Animator resets Transform.
+function Rig.apply(self: Rig)
+	for _, joint in self.joints do
+		local instance = joint.instance
+		local current = getTransform(instance)
+		local lastWritten = joint.lastWritten
+		local base = if lastWritten and joint.lastBase and same(current, lastWritten) then joint.lastBase else current
+
+		if isIdentity(joint.offset) then
+			if lastWritten then
+				if base ~= current then
+					setTransform(instance, base)
+				end
+				joint.lastWritten, joint.lastBase = nil, nil
+			end
+			continue
+		end
+
+		local out = R6Math.jointOffset(getC0(instance), joint.offset) * base
+		setTransform(instance, out)
+		joint.lastWritten, joint.lastBase = out, base
+	end
+end
+
+-- Removes every procedural offset (LOD off, disabled, rig removed).
+function Rig.restore(self: Rig)
+	self:begin()
+	self:apply()
+end
+
+function Rig.isAlive(self: Rig): boolean
+	return self.character.Parent ~= nil
+		and self.root.Parent ~= nil
+		and self.torso.Parent ~= nil
+		and self.humanoid.Health > 0
+end
+
+return Rig
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="15">
+        <Properties>
+          <string name="Name">Sensor</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Sensor
+	Per-character kinematics and ground sensing shared by all layers.
+
+	Velocity is derived from the root's POSITION history (smoothed), not from
+	AssemblyLinearVelocity: it is identical for the local player, other players
+	(interpolated replication), NPCs and anchored/animated rigs.
+]]
+
+local Config = require(script.Parent.Config)
+local R6Math = require(script.Parent.R6Math)
+local Rig = require(script.Parent.Rig)
+
+export type Sensor = {
+	lastPosition: Vector3?,
+	lastLook: Vector3?,
+	velocity: Vector3, -- world, smoothed
+	rawVelocity: Vector3,
+	acceleration: Vector3, -- world, smoothed
+	yawRate: number, -- rad/s, + = turning left
+	grounded: boolean,
+	airTime: number,
+	fallSpeed: number, -- downward speed while airborne (>= 0)
+	landingImpact: number, -- > 0 only on the frame the character lands
+	leftError: number?, -- ground height - rest foot height (root space)
+	rightError: number?,
+	groundNormal: Vector3, -- root space
+	stateWeight: number, -- 0..1, fades procedural motion in unsuitable states
+}
+
+local Sensor = {}
+
+local BLOCKING_STATES: { [Enum.HumanoidStateType]: boolean } = {
+	[Enum.HumanoidStateType.Swimming] = true,
+	[Enum.HumanoidStateType.Climbing] = true,
+	[Enum.HumanoidStateType.Seated] = true,
+	[Enum.HumanoidStateType.Ragdoll] = true,
+	[Enum.HumanoidStateType.FallingDown] = true,
+	[Enum.HumanoidStateType.Physics] = true,
+	[Enum.HumanoidStateType.PlatformStanding] = true,
+	[Enum.HumanoidStateType.Dead] = true,
+}
+
+function Sensor.new(): Sensor
+	return {
+		lastPosition = nil,
+		lastLook = nil,
+		velocity = Vector3.zero,
+		rawVelocity = Vector3.zero,
+		acceleration = Vector3.zero,
+		yawRate = 0,
+		grounded = true,
+		airTime = 0,
+		fallSpeed = 0,
+		landingImpact = 0,
+		leftError = nil,
+		rightError = nil,
+		groundNormal = Vector3.yAxis,
+		stateWeight = 1,
+	}
+end
+
+local function footRay(
+	rig: Rig.Rig,
+	side: number,
+	shift: Vector3,
+	params: RaycastParams,
+	cfg: Config.Config
+): RaycastResult?
+	local rootCF = rig.root.CFrame
+	local origin = rootCF.Position + rootCF.RightVector * (side * rig.hipHalfWidth) + shift
+	return workspace:Raycast(origin, Vector3.new(0, -cfg.sensing.rayLength, 0), params)
+end
+
+-- `sense` = false on LOD frames: kinematics still update, rays are skipped.
+function Sensor.update(
+	sensor: Sensor,
+	rig: Rig.Rig,
+	dt: number,
+	params: RaycastParams,
+	cfg: Config.Config,
+	isLocal: boolean,
+	sense: boolean
+)
+	local s = cfg.sensing
+	local rootCF = rig.root.CFrame
+	local position = rootCF.Position
+	dt = math.max(dt, 1e-3)
+
+	-- Kinematics.
+	local previousVelocity = sensor.velocity
+	if sensor.lastPosition then
+		local raw = (position - sensor.lastPosition :: Vector3) / dt
+		if raw.Magnitude > 400 then
+			raw = sensor.rawVelocity -- teleport: ignore the jump
+		end
+		sensor.rawVelocity = raw
+		sensor.velocity = sensor.velocity:Lerp(raw, R6Math.expAlpha(s.velocitySharpness, dt))
+	end
+	local accel = (sensor.velocity - previousVelocity) / dt
+	sensor.acceleration = sensor.acceleration:Lerp(accel, R6Math.expAlpha(s.accelerationSharpness, dt))
+	local look = rootCF.LookVector
+	if sensor.lastLook then
+		local rate = R6Math.yawDelta(sensor.lastLook :: Vector3, look) / dt
+		sensor.yawRate += (rate - sensor.yawRate) * R6Math.expAlpha(s.yawRateSharpness, dt)
+	end
+	sensor.lastPosition = position
+	sensor.lastLook = look
+
+	-- State weight.
+	local humanoid = rig.humanoid
+	local blocked = humanoid.Sit or humanoid.PlatformStand or humanoid.Health <= 0
+	if isLocal and not blocked then
+		blocked = BLOCKING_STATES[humanoid:GetState()] == true
+	end
+	local targetWeight = if blocked then 0 else 1
+	sensor.stateWeight += (targetWeight - sensor.stateWeight) * R6Math.expAlpha(10, dt)
+
+	-- Ground.
+	sensor.landingImpact = 0
+	if sense then
+		local horizontal = Vector3.new(sensor.velocity.X, 0, sensor.velocity.Z)
+		local shift = horizontal * s.lookAhead
+		local left = footRay(rig, -1, shift, params, cfg)
+		local right = footRay(rig, 1, shift, params, cfg)
+		sensor.leftError = if left then (left.Position.Y - position.Y) - rig.restFootY else nil
+		sensor.rightError = if right then (right.Position.Y - position.Y) - rig.restFootY else nil
+
+		local normal = Vector3.zero
+		if left then
+			normal += left.Normal
+		end
+		if right then
+			normal += right.Normal
+		end
+		sensor.groundNormal = if normal.Magnitude > 1e-3 then rootCF:VectorToObjectSpace(normal.Unit) else Vector3.yAxis
+
+		local lowestError = math.min(sensor.leftError or -math.huge, sensor.rightError or -math.huge)
+		local grounded = lowestError > -s.groundTolerance - 0.5 and math.abs(sensor.rawVelocity.Y) < 30
+		if not grounded then
+			sensor.airTime += dt
+			sensor.fallSpeed = math.max(0, -sensor.rawVelocity.Y)
+		elseif not sensor.grounded then
+			sensor.landingImpact = sensor.fallSpeed
+			sensor.airTime = 0
+			sensor.fallSpeed = 0
+		end
+		sensor.grounded = grounded
+	end
+end
+
+return Sensor
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="16">
+        <Properties>
+          <string name="Name">Spring</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	Spring
+	Analytic (closed-form) damped harmonic oscillator on Vector3.
+
+	Unlike `v += (k*x - c*v) * dt` integrators, the exact solution is unconditionally
+	stable: a 200 ms frame hitch never makes it explode. Scalars can be packed into the
+	X/Y/Z components (e.g. pitch, roll, drop).
+
+	  frequency    : undamped oscillations per second (Hz). Higher = snappier.
+	  dampingRatio : 1 = critically damped (no overshoot), < 1 = bouncy, > 1 = sluggish.
+
+	Usage:
+		local spring = Spring.new(Vector3.zero, 6, 0.5)
+		spring:impulse(Vector3.new(0, -30, 0)) -- kick the velocity
+		RunService.PreRender:Connect(function(dt) local offset = spring:update(dt) end)
+]]
+
+export type Spring = {
+	position: Vector3,
+	velocity: Vector3,
+	target: Vector3,
+	frequency: number,
+	dampingRatio: number,
+	update: (self: Spring, dt: number) -> Vector3,
+	impulse: (self: Spring, velocity: Vector3) -> (),
+	reset: (self: Spring, position: Vector3?) -> (),
+}
+
+local Spring = {}
+Spring.__index = Spring
+
+local TAU = 2 * math.pi
+
+function Spring.new(initial: Vector3, frequency: number, dampingRatio: number): Spring
+	local self = setmetatable({
+		position = initial,
+		velocity = Vector3.zero,
+		target = initial,
+		frequency = frequency,
+		dampingRatio = dampingRatio,
+	}, Spring)
+	return (self :: any) :: Spring
+end
+
+-- Pure step function, exposed for tests and for code that stores state elsewhere.
+function Spring.step(
+	position: Vector3,
+	velocity: Vector3,
+	target: Vector3,
+	frequency: number,
+	dampingRatio: number,
+	dt: number
+): (Vector3, Vector3)
+	if dt <= 0 then
+		return position, velocity
+	end
+	local omega = TAU * math.max(frequency, 1e-4)
+	local zeta = math.max(dampingRatio, 0)
+	local x0 = position - target
+	local v0 = velocity
+
+	local x: Vector3
+	local v: Vector3
+	if zeta < 0.9999 then
+		-- Under-damped.
+		local a = zeta * omega
+		local wd = omega * math.sqrt(1 - zeta * zeta)
+		local decay = math.exp(-a * dt)
+		local c = math.cos(wd * dt)
+		local s = math.sin(wd * dt)
+		x = (x0 * c + (v0 + x0 * a) * (s / wd)) * decay
+		v = (v0 * c - (v0 * a + x0 * (omega * omega)) * (s / wd)) * decay
+	elseif zeta <= 1.0001 then
+		-- Critically damped.
+		local decay = math.exp(-omega * dt)
+		local b = v0 + x0 * omega
+		x = (x0 + b * dt) * decay
+		v = (v0 - b * (omega * dt)) * decay
+	else
+		-- Over-damped.
+		local root = math.sqrt(zeta * zeta - 1)
+		local r1 = -omega * (zeta - root)
+		local r2 = -omega * (zeta + root)
+		local c1 = (v0 - x0 * r2) / (r1 - r2)
+		local c2 = x0 - c1
+		local e1 = math.exp(r1 * dt)
+		local e2 = math.exp(r2 * dt)
+		x = c1 * e1 + c2 * e2
+		v = c1 * (r1 * e1) + c2 * (r2 * e2)
+	end
+	return target + x, v
+end
+
+function Spring.update(self: Spring, dt: number): Vector3
+	self.position, self.velocity =
+		Spring.step(self.position, self.velocity, self.target, self.frequency, self.dampingRatio, dt)
+	return self.position
+end
+
+function Spring.impulse(self: Spring, velocity: Vector3)
+	self.velocity += velocity
+end
+
+function Spring.reset(self: Spring, position: Vector3?)
+	local p = position or self.target
+	self.position = p
+	self.target = p
+	self.velocity = Vector3.zero
+end
+
+return Spring
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="ModuleScript" referent="17">
+        <Properties>
+          <string name="Name">Types</string>
+          <string name="Source"><![CDATA[--!strict
+-- Shared types for procedural layers.
+
+local Config = require(script.Parent.Config)
+local Rig = require(script.Parent.Rig)
+local Sensor = require(script.Parent.Sensor)
+
+export type LookTarget = {
+	yaw: number, -- root space, + = left
+	pitch: number, -- + = up
+}
+
+export type FrameContext = {
+	isLocal: boolean, -- the local player's own character
+	lookTarget: LookTarget?, -- desired head look (camera, network, or NPC attribute)
+	weight: (attribute: string) -> number, -- character attribute multiplier (default 1)
+}
+
+export type Layer = {
+	name: string,
+	update: (rig: Rig.Rig, sensor: Sensor.Sensor, dt: number, cfg: Config.Config, ctx: FrameContext) -> (),
+}
+
+return {}
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="ServerScriptService" referent="18">
+    <Properties>
+      <string name="Name">ServerScriptService</string>
+    </Properties>
+    <Item class="Script" referent="19">
+      <Properties>
+        <string name="Name">R6ProceduralDemo</string>
+        <token name="RunContext">0</token>
+        <string name="Source"><![CDATA[--!strict
+--[[
+	Demo: builds a test course next to the spawn (stairs, ramp, rocks) and two patrolling
+	R6 NPCs tagged "R6Procedural" that look at the nearest player. Delete this script in
+	a real game. Set Game Settings > Avatar > R6 to test on your own character too.
+]]
+
+local CollectionService = game:GetService("CollectionService")
+local Players = game:GetService("Players")
+
+local R6_WALK = "rbxassetid://180426354" -- default R6 walk
+local R6_IDLE = "rbxassetid://180435571" -- default R6 idle
+
+local spawnLocation = workspace:FindFirstChildWhichIsA("SpawnLocation", true)
+local origin = if spawnLocation then spawnLocation.Position else Vector3.zero
+
+local function groundHeight(x: number, z: number): number
+	local result = workspace:Raycast(Vector3.new(x, origin.Y + 100, z), Vector3.new(0, -500, 0))
+	return if result then result.Position.Y else origin.Y
+end
+
+local courseFolder = Instance.new("Folder")
+courseFolder.Name = "R6TestCourse"
+courseFolder.Parent = workspace
+
+local function block(name: string, size: Vector3, cframe: CFrame, color: Color3, material: Enum.Material?): Part
+	local part = Instance.new("Part")
+	part.Name = name
+	part.Anchored = true
+	part.Size = size
+	part.CFrame = cframe
+	part.Color = color
+	part.Material = material or Enum.Material.Concrete
+	part.TopSurface = Enum.SurfaceType.Smooth
+	part.BottomSurface = Enum.SurfaceType.Smooth
+	part.Parent = courseFolder
+	return part
+end
+
+local baseX, baseZ = origin.X + 24, origin.Z
+local floorY = groundHeight(baseX, baseZ)
+
+-- Stairs: 8 steps of 1 stud (the classic case where one R6 foot floats).
+for i = 0, 7 do
+	block(
+		`Step{i + 1}`,
+		Vector3.new(12, (i + 1) * 1, 2.5),
+		CFrame.new(baseX, floorY + (i + 1) * 0.5, baseZ - 6 - i * 2.5),
+		Color3.fromRGB(165, 160, 150)
+	)
+end
+local topY = floorY + 8
+block(
+	"Landing",
+	Vector3.new(12, 8, 10),
+	CFrame.new(baseX, floorY + 4, baseZ - 6 - 8 * 2.5 - 3.75),
+	Color3.fromRGB(150, 145, 135)
+)
+
+-- Ramp (25 deg) back down to the floor.
+local rampLength = 8 / math.sin(math.rad(25))
+local rampRun = 8 / math.tan(math.rad(25))
+block(
+	"Ramp",
+	Vector3.new(12, 1, rampLength),
+	CFrame.new(baseX + 12, floorY + 4 - 0.5, baseZ - 6 - 8 * 2.5 - 3.75 + 5 + rampRun / 2)
+		* CFrame.Angles(math.rad(25), 0, 0),
+	Color3.fromRGB(120, 150, 110),
+	Enum.Material.Grass
+)
+block(
+	"RampTop",
+	Vector3.new(12, 8, 10),
+	CFrame.new(baseX + 12, floorY + 4, baseZ - 6 - 8 * 2.5 - 3.75),
+	Color3.fromRGB(150, 145, 135)
+)
+
+-- Scattered rocks.
+local rng = Random.new(1234)
+for i = 1, 14 do
+	local size = Vector3.new(rng:NextNumber(1.5, 3.5), rng:NextNumber(0.4, 1.4), rng:NextNumber(1.5, 3.5))
+	block(
+		`Rock{i}`,
+		size,
+		CFrame.new(baseX - 16 + rng:NextNumber(-7, 7), floorY + size.Y / 2 - 0.1, baseZ - 12 + rng:NextNumber(-10, 10))
+			* CFrame.Angles(0, rng:NextNumber(0, math.pi), rng:NextNumber(-0.15, 0.15)),
+		Color3.fromRGB(105, 100, 95),
+		Enum.Material.Slate
+	)
+end
+local _ = topY
+
+-- NPCs --------------------------------------------------------------------------------
+
+local function loadTrack(humanoid: Humanoid, id: string, looped: boolean): AnimationTrack?
+	local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator")
+	animator.Parent = humanoid
+	local animation = Instance.new("Animation")
+	animation.AnimationId = id
+	local ok, track = pcall(function()
+		return animator:LoadAnimation(animation)
+	end)
+	if ok and track then
+		track.Looped = looped
+		return track
+	end
+	return nil
+end
+
+local function nearestHead(position: Vector3): Vector3?
+	local best: Vector3? = nil
+	local bestDistance = 60
+	for _, player in Players:GetPlayers() do
+		local head = player.Character and player.Character:FindFirstChild("Head")
+		if head and head:IsA("BasePart") then
+			local d = (head.Position - position).Magnitude
+			if d < bestDistance then
+				best, bestDistance = head.Position, d
+			end
+		end
+	end
+	return best
+end
+
+local function spawnNpc(name: string, waypoints: { Vector3 }, walkSpeed: number)
+	local ok, created = pcall(function()
+		return Players:CreateHumanoidModelFromDescription(Instance.new("HumanoidDescription"), Enum.HumanoidRigType.R6)
+	end)
+	if not ok or created == nil then
+		warn("[R6Demo] cannot create NPC:", created)
+		return
+	end
+	local npc = created :: Model
+	npc.Name = name
+	npc:PivotTo(CFrame.new(waypoints[1] + Vector3.new(0, 3, 0)))
+	npc.Parent = workspace
+	CollectionService:AddTag(npc, "R6Procedural")
+
+	local humanoid = npc:FindFirstChildOfClass("Humanoid") :: Humanoid
+	local root = npc:FindFirstChild("HumanoidRootPart") :: BasePart
+	humanoid.WalkSpeed = walkSpeed
+	root:SetNetworkOwner(nil)
+
+	local walk = loadTrack(humanoid, R6_WALK, true)
+	local idle = loadTrack(humanoid, R6_IDLE, true)
+	if idle then
+		idle:Play()
+	end
+	humanoid.Running:Connect(function(speed)
+		if walk then
+			if speed > 0.5 and not walk.IsPlaying then
+				walk:Play(0.2)
+			elseif speed <= 0.5 and walk.IsPlaying then
+				walk:Stop(0.2)
+			end
+			if walk.IsPlaying then
+				walk:AdjustSpeed(speed / 16)
+			end
+		end
+	end)
+
+	task.spawn(function()
+		local index = 1
+		while npc.Parent and humanoid.Health > 0 do
+			index = index % #waypoints + 1
+			humanoid:MoveTo(waypoints[index])
+			humanoid.MoveToFinished:Wait()
+			task.wait(1.5)
+		end
+	end)
+	task.spawn(function()
+		while npc.Parent do
+			npc:SetAttribute("R6_LookAt", nearestHead(root.Position))
+			task.wait(0.2)
+		end
+	end)
+end
+
+local stairsBottom = Vector3.new(baseX, floorY, baseZ - 2)
+local stairsTop = Vector3.new(baseX, topY, baseZ - 6 - 8 * 2.5 - 3.75)
+local rampTop = Vector3.new(baseX + 12, topY, baseZ - 6 - 8 * 2.5 - 3.75)
+local rampBottom = Vector3.new(baseX + 12, floorY, baseZ - 6 - 8 * 2.5 - 3.75 + 5 + rampRun + 3)
+local rocks = Vector3.new(baseX - 16, floorY, baseZ - 12)
+
+spawnNpc("StairWalker", { stairsBottom, stairsTop, rampTop, rampBottom }, 10)
+spawnNpc("RockWalker", { rocks + Vector3.new(0, 0, 9), rocks + Vector3.new(0, 0, -9) }, 7)
+]]></string>
+      </Properties>
+    </Item>
+    <Item class="Folder" referent="20">
+      <Properties>
+        <string name="Name">R6ProceduralServer</string>
+      </Properties>
+      <Item class="ModuleScript" referent="21">
+        <Properties>
+          <string name="Name">LookRelay</string>
+          <string name="Source"><![CDATA[--!strict
+--[[
+	LookRelay (server)
+	Relays head-look angles between clients. Joint Transform/C0 edits made on a client
+	never replicate, so each client sends its own look (4 bytes, <= 15 Hz) and the server
+	broadcasts one batched packet to everyone at 15 Hz.
+
+	* Validates type, size, NaN and range; rate-limits each player (30 packets/s).
+	* Only changed entries are broadcast, plus a full refresh every 2 s for late joiners.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+local LookNet = require(ReplicatedStorage:WaitForChild("R6Procedural"):WaitForChild("LookNet"))
+
+type State = { yaw: number, pitch: number, dirty: boolean }
+type Budget = { windowStart: number, count: number }
+
+local LookRelay = {}
+
+local BROADCAST_INTERVAL = 1 / 15
+local FULL_REFRESH_INTERVAL = 2
+local MAX_PACKETS_PER_SECOND = 30
+
+local states: { [Player]: State } = {}
+local budgets: { [Player]: Budget } = {}
+local started = false
+
+local function allowed(player: Player): boolean
+	local now = os.clock()
+	local budget = budgets[player]
+	if budget == nil or now - budget.windowStart >= 1 then
+		budgets[player] = { windowStart = now, count = 1 }
+		return true
+	end
+	budget.count += 1
+	return budget.count <= MAX_PACKETS_PER_SECOND
+end
+
+function LookRelay.start()
+	if started then
+		return
+	end
+	started = true
+
+	local folder = Instance.new("Folder")
+	folder.Name = "R6ProceduralRemotes"
+	local remote = Instance.new("UnreliableRemoteEvent")
+	remote.Name = "Look"
+	remote.Parent = folder
+	folder.Parent = ReplicatedStorage
+
+	remote.OnServerEvent:Connect(function(player: Player, payload: unknown)
+		if not allowed(player) then
+			return
+		end
+		local yaw, pitch = LookNet.decodeLocal(payload)
+		if yaw == nil or pitch == nil then
+			return
+		end
+		local state = states[player]
+		local clampedYaw = math.clamp(yaw, -math.pi, math.pi)
+		local clampedPitch = math.clamp(pitch, -math.pi / 2, math.pi / 2)
+		if state then
+			state.yaw, state.pitch, state.dirty = clampedYaw, clampedPitch, true
+		else
+			states[player] = { yaw = clampedYaw, pitch = clampedPitch, dirty = true }
+		end
+	end)
+
+	local broadcastClock, refreshClock = 0, 0
+	RunService.Heartbeat:Connect(function(dt)
+		broadcastClock += dt
+		refreshClock += dt
+		if broadcastClock < BROADCAST_INTERVAL then
+			return
+		end
+		broadcastClock = 0
+		local full = refreshClock >= FULL_REFRESH_INTERVAL
+		if full then
+			refreshClock = 0
+		end
+
+		local batch: { LookNet.Entry } = {}
+		for player, state in states do
+			if state.dirty or full then
+				state.dirty = false
+				table.insert(batch, { userId = player.UserId, yaw = state.yaw, pitch = state.pitch })
+				if #batch == LookNet.MAX_ENTRIES then
+					remote:FireAllClients(LookNet.encodeBatch(batch))
+					batch = {}
+				end
+			end
+		end
+		if #batch > 0 then
+			remote:FireAllClients(LookNet.encodeBatch(batch))
+		end
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		states[player] = nil
+		budgets[player] = nil
+	end)
+end
+
+return LookRelay
+]]></string>
+        </Properties>
+      </Item>
+      <Item class="Script" referent="22">
+        <Properties>
+          <string name="Name">Main</string>
+          <token name="RunContext">0</token>
+          <string name="Source"><![CDATA[--!strict
+-- ServerScriptService.R6ProceduralServer.Main: starts the head-look relay.
+local LookRelay = require(script.Parent:WaitForChild("LookRelay"))
+
+LookRelay.start()
+]]></string>
+        </Properties>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="StarterPlayer" referent="23">
+    <Properties>
+      <string name="Name">StarterPlayer</string>
+    </Properties>
+    <Item class="StarterPlayerScripts" referent="24">
+      <Properties>
+        <string name="Name">StarterPlayerScripts</string>
+      </Properties>
+      <Item class="Folder" referent="25">
+        <Properties>
+          <string name="Name">R6ProceduralClient</string>
+        </Properties>
+        <Item class="LocalScript" referent="26">
+          <Properties>
+            <string name="Name">R6ProceduralBootstrap</string>
+            <string name="Source"><![CDATA[--!strict
+-- StarterPlayerScripts: procedural R6 motion for every visible R6 character.
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Controller = require(ReplicatedStorage:WaitForChild("R6Procedural"):WaitForChild("Controller"))
+
+Controller.start()
+]]></string>
+          </Properties>
+        </Item>
+      </Item>
+    </Item>
+  </Item>
+  <Item class="Workspace" referent="27">
+    <Properties>
+      <string name="Name">Workspace</string>
+      <bool name="NeedsPivotMigration">false</bool>
+    </Properties>
+    <Item class="Part" referent="28">
+      <Properties>
+        <string name="Name">Baseplate</string>
+        <bool name="Anchored">true</bool>
+        <Color3uint8 name="Color3uint8">6512217</Color3uint8>
+        <bool name="Locked">true</bool>
+        <token name="Material">816</token>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>-10</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>512</X>
+          <Y>20</Y>
+          <Z>512</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+    <Item class="SpawnLocation" referent="29">
+      <Properties>
+        <string name="Name">SpawnLocation</string>
+        <bool name="Anchored">true</bool>
+        <Vector3 name="Position">
+          <X>0</X>
+          <Y>0.5</Y>
+          <Z>0</Z>
+        </Vector3>
+        <Vector3 name="size">
+          <X>12</X>
+          <Y>1</Y>
+          <Z>12</Z>
+        </Vector3>
+      </Properties>
+    </Item>
+  </Item>
+</roblox>

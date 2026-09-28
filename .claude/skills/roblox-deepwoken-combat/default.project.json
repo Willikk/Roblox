@@ -1,0 +1,36 @@
+{
+  "name": "roblox-deepwoken-combat",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Combat": { "$path": "src/shared/Combat" },
+      "VFX": { "$path": "../roblox-mesh-vfx/src/shared/VFX" },
+      "R6Procedural": { "$path": "../roblox-r6-procedural-animation/src/shared/R6Procedural" }
+    },
+    "ServerScriptService": {
+      "CombatServer": { "$path": "src/server" },
+      "VFXServer": {
+        "$className": "Folder",
+        "VFXService": { "$path": "../roblox-mesh-vfx/src/server/VFXService.luau" }
+      },
+      "R6ProceduralServer": { "$path": "../roblox-r6-procedural-animation/src/server" },
+      "CombatArena": { "$path": "src/demo/Arena.server.luau" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "CombatClient": { "$path": "src/client" }
+      }
+    },
+    "Workspace": {
+      "$className": "Workspace",
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": { "Anchored": true, "Size": [512, 20, 512], "Position": [0, -10, 0], "Color": [0.36, 0.35, 0.33], "Material": "Slate", "Locked": true }
+      },
+      "SpawnLocation": {
+        "$className": "SpawnLocation",
+        "$properties": { "Anchored": true, "Size": [10, 1, 10], "Position": [0, 0.5, 0] }
+      }
+    }
+  }
+}

@@ -38,7 +38,11 @@ meshes when they exist in `ReplicatedStorage.Assets.VFX`.
    ```
 
 Built-in effects: `Slash`, `Shockwave`, `CraterRocks`, `ImpactBurst` (sparks + flash + victim
-highlight + hitstop + camera), `GroundSlam` (shockwave + crater + dust + distance shake).
+highlight + hitstop + camera), `GroundSlam` (shockwave + crater + dust + distance shake), and the
+melee-combat set used by `roblox-deepwoken-combat`: `Parry` (yellow star spark + ring + light,
+heavy hitstop), `Block`, `GuardBreak` (shards, rings, impact frame), `FistImpact` (air-pressure
+rings), `Telegraph` (red flash for perilous attacks). Building blocks: `Shapes` (flash, ring,
+star, shards, highlight).
 
 ## Non-negotiable architecture
 
