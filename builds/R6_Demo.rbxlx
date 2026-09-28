@@ -395,6 +395,11 @@ local function onPreSimulation(dt: number)
 		if interval and type(action) == "string" and action ~= "" then
 			interval = 0
 		end
+		-- Limited animation ("on twos"): workspace attribute R6_StepFps holds poses between steps.
+		local stepFps = workspace:GetAttribute("R6_StepFps")
+		if interval and type(stepFps) == "number" and stepFps > 0 then
+			interval = math.max(interval, 1 / stepFps)
+		end
 		if interval == nil then
 			if entry.enabled then
 				rig:restore()
@@ -594,6 +599,11 @@ function ActionPose.update(rig, sensor, _dt, _cfg, ctx)
 	local clip = PoseLibrary.get(name)
 	if clip == nil then
 		return
+	end
+	-- Limited animation: snap the clip time to R6_StepFps steps (keys hold, then pop).
+	local stepFps = workspace:GetAttribute("R6_StepFps")
+	if type(stepFps) == "number" and stepFps > 0 then
+		elapsed = math.floor(elapsed * stepFps) / stepFps
 	end
 	local pose, weight = PoseLibrary.sample(clip, elapsed)
 	weight *= ctx.weight("R6_ActionWeight") * math.max(sensor.stateWeight, 0.35)

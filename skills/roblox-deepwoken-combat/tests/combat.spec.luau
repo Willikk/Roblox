@@ -126,13 +126,15 @@ return function(t)
 	end)
 
 	t.test("weapon data is consistent", function()
-		for _, name in { "Fists", "Sword" } do
+		local seen = {}
+		for _, name in Weapons.NAMES do
 			local w = Weapons.get(name)
 			expect.truthy(w, name)
-			expect.eq(#w.chain, 4, "4-hit chain")
-			expect.truthy(w.chain[4].finisher, "last hit is a finisher")
-			local seen = {}
-			for _, move in { w.chain[1], w.chain[2], w.chain[3], w.chain[4], w.critical } do
+			expect.truthy(#w.chain >= 3, "3+ hit chain")
+			expect.truthy(w.chain[#w.chain].finisher, "last hit is a finisher")
+			local moves = table.clone(w.chain)
+			table.insert(moves, w.critical)
+			for _, move in moves do
 				expect.truthy(not seen[move.name], "unique clip names")
 				seen[move.name] = true
 				local windup, active, recovery = Weapons.timing(w, move)
@@ -144,6 +146,11 @@ return function(t)
 		expect.truthy(Weapons.Fists.chain[1].hitboxSize.Z < Weapons.Sword.chain[1].hitboxSize.Z, "fists are shorter")
 		expect.truthy(Weapons.Sword.critical.perilous, "sword critical is perilous")
 		expect.truthy(Weapons.Sword.critical.windup >= 0.6, "perilous windup leaves time to dodge")
+		expect.truthy(Weapons.Greatsword.speed < Weapons.Sword.speed, "greatsword is slowest")
+		expect.truthy(
+			Weapons.Greatsword.chain[1].hitboxSize.X > Weapons.Sword.chain[1].hitboxSize.X,
+			"greatsword is widest"
+		)
 	end)
 
 	-- Pose geometry: where does the hand end up?
@@ -182,6 +189,13 @@ return function(t)
 			expect.truthy((w - s).Magnitude > 1.5, `strike {i} travels`)
 		end
 		expect.truthy(hand(Weapons.Sword.chain[3].poses.windup, "Right").Y > 1.8, "overhead windup")
+	end)
+
+	t.test("greatsword swings end in front of the body", function()
+		for i, move in Weapons.Greatsword.chain do
+			local s = hand(move.poses.strike, "Right")
+			expect.truthy(s.Z < -0.5 or s.Y > 1.5, `greatsword strike {i} (got {s})`)
+		end
 	end)
 
 	t.test("fist chain alternates hands and extends forward", function()

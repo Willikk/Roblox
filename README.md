@@ -11,7 +11,7 @@ Each skill is two things at once:
    playable demo.
 
 Everything is `--!strict`, type-checked against the Roblox API definitions, linted, formatted
-and unit-tested in CI (63 tests, including forward-kinematics proofs on a simulated R6 rig).
+and unit-tested in CI (71 tests, including forward-kinematics proofs on a simulated R6 rig).
 
 ---
 
@@ -58,6 +58,16 @@ Server-authoritative sword & fists melee (Deepwoken / Sekiro model).
 - Lag-compensated hitboxes (position history + capped rewind), client prediction.
 - Procedural attack animations generated from move timings (zero animation assets).
 - Playable arena with Guard / Parry / Fighter training NPCs.
+
+### 4. [`roblox-dark-pixel-style`](./.claude/skills/roblox-dark-pixel-style/)
+Dark-fantasy pixel-art direction (Berserk ink × Fear & Hunger rot).
+
+- Procedural pixel-art library (strict palette, 1-px outlines, Bayer dithering, binary
+  alpha): brushed slashes, blood/ichor bursts, ink impact bursts, sparks, smoke, flames,
+  speed lines, grain, vignette. Exportable to PNG (`tools/export-sprites.luau`).
+- 3D pixel sprites animated "on twos" (stepped 12 fps), ground blood pools.
+- Screen presets `Berserk`, `FearAndHunger`, `Eclipse` + manga impact frames.
+- Dark combat theme and a Dragonslayer-style greatsword; the Rojo project is the full demo.
 
 ---
 

@@ -32,7 +32,7 @@ function Clips.registerAll()
 		return
 	end
 	registered = true
-	for _, name in { "Fists", "Sword" } do
+	for _, name in Weapons.NAMES do
 		local weapon = Weapons.get(name)
 		if weapon == nil then
 			continue

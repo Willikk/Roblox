@@ -91,6 +91,11 @@ function ActionPose.update(rig, sensor, _dt, _cfg, ctx)
 	if clip == nil then
 		return
 	end
+	-- Limited animation: snap the clip time to R6_StepFps steps (keys hold, then pop).
+	local stepFps = workspace:GetAttribute("R6_StepFps")
+	if type(stepFps) == "number" and stepFps > 0 then
+		elapsed = math.floor(elapsed * stepFps) / stepFps
+	end
 	local pose, weight = PoseLibrary.sample(clip, elapsed)
 	weight *= ctx.weight("R6_ActionWeight") * math.max(sensor.stateWeight, 0.35)
 	if weight <= 1e-3 then

@@ -44,7 +44,7 @@ local function face(root: BasePart, target: Vector3)
 end
 
 local function moveInfo(clip: string): (Weapons.Weapon?, Weapons.Move?)
-	for _, name in { "Fists", "Sword" } do
+	for _, name in Weapons.NAMES do
 		local weapon = Weapons.get(name)
 		if weapon then
 			for _, move in weapon.chain do

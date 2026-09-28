@@ -24,7 +24,11 @@ the `roblox-mesh-vfx` and `roblox-r6-procedural-animation` skills it builds on).
    Avatar → **R6**, Play. The arena spawns three NPCs: `Guard` (holds block → break its posture),
    `Parry` (parries on reaction → feint it with M2), `Fighter` (sword chains + red-flash
    criticals → parry with F, dodge the red ones with Q).
-2. Controls: M1 attack · M2 feint · R critical · F tap parry / hold block · Q dodge · 1 fists · 2 sword.
+2. Controls: M1 attack · M2 feint · R critical · F tap parry / hold block · Q dodge · 1 fists ·
+   2 sword · 3 greatsword (Dragonslayer-style: slow, huge reach, 3-hit chain, spinning perilous).
+3. Visual theme: `Config.vfxTheme` or workspace attribute `CombatVFXTheme` (`Default` glow
+   VFX, `Dark` pixel-art effects from `roblox-dark-pixel-style`). `Config.effect(kind, fallback)`
+   resolves every outcome's effect name.
 
 ## Architecture
 

@@ -43,6 +43,7 @@ export type Weapon = {
 	parryPose: PoseSpec,
 	hitEffect: string, -- VFX on a clean hit ("ImpactBurst" / "FistImpact")
 	hasBlade: boolean,
+	blade: { size: Vector3, color: Color3, material: Enum.Material }?, -- visual blade (default sword)
 }
 
 local function r(x: number, y: number, z: number, pos: Vector3?): { rot: Vector3, pos: Vector3? }
@@ -314,11 +315,154 @@ Weapons.Sword = (
 	} :: any
 ) :: Weapon
 
+Weapons.Greatsword = (
+	{
+		-- Dragonslayer-style slab of iron: slow, enormous reach, crushing posture damage.
+		name = "Greatsword",
+		speed = 0.74,
+		hitEffect = "ImpactBurst",
+		hasBlade = true,
+		blade = {
+			size = Vector3.new(0.35, 1.25, 7.5),
+			color = Color3.fromRGB(58, 56, 55),
+			material = Enum.Material.CorrodedMetal,
+		},
+		chain = {
+			m({
+				name = "Greatsword_M1_1", -- wide horizontal cleave (two hands)
+				windup = 0.34,
+				active = 0.15,
+				recovery = 0.3,
+				damage = 19,
+				postureDamage = 26,
+				hitboxSize = Vector3.new(15, 7, 11),
+				hitboxForward = 5.5,
+				vfx = "Slash",
+				slashTilt = 10,
+				poses = {
+					windup = {
+						RightShoulder = r(92, 48, 0),
+						LeftShoulder = r(92, 62, 0),
+						RootJoint = r(4, 44, 0, Vector3.new(0, -0.3, 0.3)),
+					},
+					strike = {
+						RightShoulder = r(90, -10, 0),
+						LeftShoulder = r(90, 0, 0),
+						RootJoint = r(-10, -40, 0, Vector3.new(0, -0.45, -0.5)),
+						LeftHip = r(26, 0, 0),
+						RightHip = r(-18, 0, 0),
+					},
+					follow = {
+						RightShoulder = r(80, -22, 0),
+						LeftShoulder = r(80, -12, 0),
+						RootJoint = r(-8, -48, 0, Vector3.new(0, -0.4, -0.4)),
+					},
+				},
+			}),
+			m({
+				name = "Greatsword_M1_2", -- rising diagonal
+				windup = 0.33,
+				active = 0.15,
+				recovery = 0.3,
+				damage = 19,
+				postureDamage = 26,
+				hitboxSize = Vector3.new(12, 9, 11),
+				hitboxForward = 5.5,
+				vfx = "Slash",
+				slashTilt = -50,
+				slashMirror = true,
+				poses = {
+					windup = {
+						RightShoulder = r(20, 0, 30),
+						LeftShoulder = r(30, 0, 40),
+						RootJoint = r(-6, -30, 0, Vector3.new(0, -0.5, 0.2)),
+					},
+					strike = {
+						RightShoulder = r(165, 0, -30),
+						LeftShoulder = r(150, 0, -20),
+						RootJoint = r(12, 30, 0, Vector3.new(0, 0.1, -0.4)),
+						Neck = r(10, 0, 0),
+					},
+				},
+			}),
+			m({
+				name = "Greatsword_M1_3", -- falling cleave, full body
+				windup = 0.4,
+				active = 0.16,
+				recovery = 0.38,
+				damage = 23,
+				postureDamage = 32,
+				hitboxSize = Vector3.new(8, 9, 12),
+				hitboxForward = 6,
+				knockback = 55,
+				finisher = true,
+				vfx = "Slash",
+				slashTilt = 88,
+				poses = {
+					windup = {
+						RightShoulder = r(182, 0, 6),
+						LeftShoulder = r(178, 0, -6),
+						RootJoint = r(18, 0, 0, Vector3.new(0, 0.1, 0.4)),
+						Neck = r(12, 0, 0),
+					},
+					strike = {
+						RightShoulder = r(40, 0, -4),
+						LeftShoulder = r(34, 0, 4),
+						RootJoint = r(-32, 0, 0, Vector3.new(0, -0.8, -0.9)),
+						LeftHip = r(40, 0, 0),
+						RightHip = r(-28, 0, 0),
+						Neck = r(-8, 0, 0),
+					},
+				},
+			}),
+		},
+		critical = m({
+			name = "Greatsword_Critical", -- spinning perilous cleave
+			windup = 0.85,
+			active = 0.2,
+			recovery = 0.55,
+			damage = 34,
+			postureDamage = 0,
+			hitboxSize = Vector3.new(18, 8, 16),
+			hitboxForward = 4,
+			knockback = 60,
+			finisher = true,
+			perilous = true,
+			hyperArmor = true,
+			vfx = "Slash",
+			slashTilt = 5,
+			poses = {
+				windup = {
+					RightShoulder = r(96, 70, 0),
+					LeftShoulder = r(96, 80, 0),
+					RootJoint = r(8, 70, 0, Vector3.new(0, -0.5, 0.3)),
+					Neck = r(0, -40, 0),
+				},
+				strike = {
+					RightShoulder = r(92, -30, 0),
+					LeftShoulder = r(92, -20, 0),
+					RootJoint = r(-14, -80, 0, Vector3.new(0, -0.6, -0.4)),
+					LeftHip = r(20, 0, 0),
+					RightHip = r(-20, 0, 0),
+				},
+			},
+		}),
+		blockPose = {
+			RightShoulder = r(70, 0, -30),
+			LeftShoulder = r(80, 0, -10),
+			RootJoint = r(-8, 22, 0, Vector3.new(0, -0.3, 0)),
+		},
+		parryPose = { RightShoulder = r(120, 0, -40), LeftShoulder = r(110, 0, -20), RootJoint = r(4, 26, 0) },
+	} :: any
+) :: Weapon
+
 -- Scaled timings for a move with its weapon speed.
 function Weapons.timing(weapon: Weapon, move: Move): (number, number, number)
 	local s = weapon.speed
 	return move.windup / s, move.active / s, move.recovery / s
 end
+
+Weapons.NAMES = { "Fists", "Sword", "Greatsword" }
 
 function Weapons.get(name: string): Weapon?
 	local w = (Weapons :: any)[name]

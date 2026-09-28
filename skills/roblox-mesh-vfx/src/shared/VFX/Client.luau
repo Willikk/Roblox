@@ -46,6 +46,15 @@ local effects: { [string]: Types.Effect } = {}
 local started = false
 local adaptiveQuality = 1
 
+-- Registers an effect implemented outside VFX/Effects (themes, game-specific effects).
+-- The name must also be listed in Registry.luau to travel over the network.
+function Client.registerEffect(name: string, effect: Types.Effect)
+	effects[name] = effect
+	if started and effect.preload then
+		task.spawn(effect.preload)
+	end
+end
+
 local function loadEffect(name: string): Types.Effect?
 	local cached = effects[name]
 	if cached then
@@ -161,6 +170,9 @@ function Client.start()
 	started = true
 
 	for _, name in Registry.names() do
+		if effects[name] == nil and script.Parent.Effects:FindFirstChild(name) == nil then
+			continue -- provided at runtime by Client.registerEffect
+		end
 		local effect = loadEffect(name)
 		if effect and effect.preload then
 			local ok, err = (pcall :: any)(effect.preload)

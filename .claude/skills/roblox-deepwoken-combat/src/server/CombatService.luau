@@ -127,16 +127,25 @@ local function resolveHit(a: Entity, d: Entity, move: Weapons.Move, isCritical: 
 	elseif outcome == "Parried" then
 		d.fighter.lastParryWhiff = -math.huge -- a successful parry is never punished
 		stun(a, cfg.parriedStun, "Parried")
-		VFXService.play("Parry", { cframe = hitFrame, source = d.model, target = a.model, power = 1.5 })
+		VFXService.play(
+			Config.effect("Parry", "Parry"),
+			{ cframe = hitFrame, source = d.model, target = a.model, power = 1.5 }
+		)
 	elseif outcome == "Blocked" then
 		d.fighter.lastPostureHit = t
 		knockback(d, direction * 10)
-		VFXService.play("Block", { cframe = hitFrame, source = a.model, target = d.model, power = 1 })
+		VFXService.play(
+			Config.effect("Block", "Block"),
+			{ cframe = hitFrame, source = a.model, target = d.model, power = 1 }
+		)
 	elseif outcome == "GuardBreak" then
 		d.fighter.lastPostureHit = t
 		stun(d, cfg.guardBreakStun, "GuardBroken", "GuardBroken")
 		knockback(d, direction * 18)
-		VFXService.play("GuardBreak", { cframe = hitFrame, source = a.model, target = d.model, power = 2 })
+		VFXService.play(
+			Config.effect("GuardBreak", "GuardBreak"),
+			{ cframe = hitFrame, source = a.model, target = d.model, power = 2 }
+		)
 	else -- Hit
 		d.humanoid:TakeDamage(move.damage)
 		local armored = d.fighter.hyperArmor and d.fighter.phase == "windup"
@@ -147,7 +156,7 @@ local function resolveHit(a: Entity, d: Entity, move: Weapons.Move, isCritical: 
 			knockback(d, direction * move.knockback + Vector3.new(0, move.knockback * 0.35, 0))
 		end
 		local heavy = move.finisher == true or isCritical
-		VFXService.play(a.weapon.hitEffect, {
+		VFXService.play(Config.effect("Hit", a.weapon.hitEffect), {
 			cframe = hitFrame,
 			source = a.model,
 			target = d.model,
@@ -161,7 +170,7 @@ end
 local function strike(e: Entity, move: Weapons.Move, rewindTime: number, isCritical: boolean)
 	local box = Hitbox.boxFor(e.root.CFrame, move.hitboxForward)
 	if move.vfx == "Slash" then
-		VFXService.play("Slash", {
+		VFXService.play(Config.effect("Slash", "Slash"), {
 			cframe = slashFrame(e.root.CFrame, move),
 			power = if isCritical then 2.2 else 1.2,
 			variant = if move.slashMirror then 1 else 0,
@@ -206,7 +215,10 @@ local function startAttack(e: Entity, critical: boolean, clientTime: number?)
 	f.hyperArmor = move.hyperArmor == true
 	setAction(e, move.name)
 	if move.perilous then
-		VFXService.play("Telegraph", { cframe = e.root.CFrame, source = e.model, power = 1 })
+		VFXService.play(
+			Config.effect("Telegraph", "Telegraph"),
+			{ cframe = e.root.CFrame, source = e.model, power = 1 }
+		)
 	end
 
 	-- Lag compensation: rewind defenders to what the attacker saw at strike time, capped.
@@ -306,11 +318,13 @@ local function equipBlade(e: Entity)
 	if arm == nil or not arm:IsA("BasePart") then
 		return
 	end
+	local spec = e.weapon.blade
+	local size = if spec then spec.size else Vector3.new(0.14, 0.45, 4.4)
 	local blade = Instance.new("Part")
 	blade.Name = "CombatBlade"
-	blade.Size = Vector3.new(0.14, 0.45, 4.4)
-	blade.Material = Enum.Material.Metal
-	blade.Color = Color3.fromRGB(200, 205, 215)
+	blade.Size = size
+	blade.Material = if spec then spec.material else Enum.Material.Metal
+	blade.Color = if spec then spec.color else Color3.fromRGB(200, 205, 215)
 	blade.CanCollide = false
 	blade.CanQuery = false
 	blade.CanTouch = false
@@ -318,16 +332,16 @@ local function equipBlade(e: Entity)
 	local weld = Instance.new("Weld")
 	weld.Part0 = arm
 	weld.Part1 = blade
-	weld.C0 = CFrame.new(0, -1.05, -2.35) -- held in the fist, blade forward
+	weld.C0 = CFrame.new(0, -1.05, -size.Z / 2 + 0.2) -- held in the fist, blade forward
 	weld.Parent = blade
 	-- Trail between base and tip; clients enable it during active frames.
 	local base = Instance.new("Attachment")
 	base.Name = "TrailBase"
-	base.Position = Vector3.new(0, 0, 1.6)
+	base.Position = Vector3.new(0, 0, size.Z * 0.36)
 	base.Parent = blade
 	local tip = Instance.new("Attachment")
 	tip.Name = "TrailTip"
-	tip.Position = Vector3.new(0, 0, -2.2)
+	tip.Position = Vector3.new(0, 0, -size.Z * 0.5)
 	tip.Parent = blade
 	local trail = Instance.new("Trail")
 	trail.Name = "SwingTrail"

@@ -44,8 +44,33 @@ local Config = {
 	hitboxPadding = 1.2, -- body radius added to the hitbox (studs)
 	maxInputsPerSecond = 20,
 	baseWalkSpeed = 16,
+
+	-- Visual theme: "Default" (glow VFX) or "Dark" (pixel-art, roblox-dark-pixel-style).
+	-- Override live with workspace attribute CombatVFXTheme.
+	vfxTheme = "Default",
 }
 
 export type Config = typeof(Config)
+
+-- Effect names per outcome for each theme ("Hit" nil = weapon.hitEffect).
+Config.themes = {
+	Default = { Slash = "Slash", Parry = "Parry", Block = "Block", GuardBreak = "GuardBreak", Telegraph = "Telegraph" },
+	Dark = {
+		Slash = "DarkSlash",
+		Parry = "DarkParry",
+		Block = "DarkBlock",
+		GuardBreak = "DarkGuardBreak",
+		Telegraph = "DarkTelegraph",
+		Hit = "DarkHit",
+	},
+} :: { [string]: { [string]: string } }
+
+-- Resolves the effect for an outcome under the active theme.
+function Config.effect(kind: string, fallback: string): string
+	local themeName = workspace:GetAttribute("CombatVFXTheme")
+	local theme = Config.themes[if type(themeName) == "string" then themeName else Config.vfxTheme]
+		or Config.themes.Default
+	return theme[kind] or fallback
+end
 
 return Config

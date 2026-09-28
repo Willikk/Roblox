@@ -584,6 +584,7 @@ CameraShaker.settings = {
 	exponent = 2,
 	kickScale = math.rad(4), -- radians of rotation for kick strength 1
 	intensity = 1, -- global user setting (0 disables)
+	stepFps = 0, -- > 0: noise advances in hard steps (choppy, low-framerate art styles)
 	reducedMotionScale = 0.25,
 }
 
@@ -650,7 +651,8 @@ local function apply(dt: number)
 
 	local s = scale()
 	local shake = (trauma ^ cfg.exponent) * s
-	local t = elapsed * cfg.frequency
+	local sampleTime = if cfg.stepFps > 0 then math.floor(elapsed * cfg.stepFps) / cfg.stepFps else elapsed
+	local t = sampleTime * cfg.frequency
 
 	local pitch = cfg.maxAngles.X * shake * math.noise(t, 11.3, 0.5) * 2
 	local yaw = cfg.maxAngles.Y * shake * math.noise(t, 27.1, 0.5) * 2
@@ -810,6 +812,15 @@ local effects: { [string]: Types.Effect } = {}
 local started = false
 local adaptiveQuality = 1
 
+-- Registers an effect implemented outside VFX/Effects (themes, game-specific effects).
+-- The name must also be listed in Registry.luau to travel over the network.
+function Client.registerEffect(name: string, effect: Types.Effect)
+	effects[name] = effect
+	if started and effect.preload then
+		task.spawn(effect.preload)
+	end
+end
+
 local function loadEffect(name: string): Types.Effect?
 	local cached = effects[name]
 	if cached then
@@ -925,6 +936,9 @@ function Client.start()
 	started = true
 
 	for _, name in Registry.names() do
+		if effects[name] == nil and script.Parent.Effects:FindFirstChild(name) == nil then
+			continue -- provided at runtime by Client.registerEffect
+		end
 		local effect = loadEffect(name)
 		if effect and effect.preload then
 			local ok, err = (pcall :: any)(effect.preload)
@@ -3106,6 +3120,13 @@ local NAMES: { string } = {
 	"GuardBreak",
 	"FistImpact",
 	"Telegraph",
+	-- Dark pixel-art theme (roblox-dark-pixel-style), registered at runtime.
+	"DarkSlash",
+	"DarkHit",
+	"DarkParry",
+	"DarkBlock",
+	"DarkGuardBreak",
+	"DarkTelegraph",
 }
 
 local Registry = {}

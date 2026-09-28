@@ -61,7 +61,7 @@ end
 ------------------------------------------------------------------------------------
 
 local moveByName: { [string]: { weapon: Weapons.Weapon, move: Weapons.Move } } = {}
-for _, name in { "Fists", "Sword" } do
+for _, name in Weapons.NAMES do
 	local weapon = Weapons.get(name)
 	if weapon then
 		for _, move in weapon.chain do
@@ -186,7 +186,7 @@ local function attack(critical: boolean)
 			end
 			local _, r = character()
 			if r then
-				VFXClient.play("Slash", {
+				VFXClient.play(Config.effect("Slash", "Slash"), {
 					cframe = r.CFrame * CFrame.new(0, 0.6, -2.4) * CFrame.Angles(0, 0, math.rad(move.slashTilt or 0)),
 					power = if critical then 2.2 else 1.2,
 					variant = if move.slashMirror then 1 else 0,
@@ -319,6 +319,11 @@ bind("CombatSword", function(state)
 		input:FireServer("Equip", "Sword")
 	end
 end, Enum.KeyCode.Two)
+bind("CombatGreatsword", function(state)
+	if state == Enum.UserInputState.Begin then
+		input:FireServer("Equip", "Greatsword")
+	end
+end, Enum.KeyCode.Three)
 
 ------------------------------------------------------------------------------------
 -- HUD: posture bar (fills with blocked damage; full = guard break)
@@ -348,7 +353,7 @@ help.TextColor3 = Color3.new(1, 1, 1)
 help.TextStrokeTransparency = 0.5
 help.Font = Enum.Font.GothamMedium
 help.TextSize = 14
-help.Text = "M1 attack · M2 feint · R critical · F parry/hold block · Q dodge · 1 fists · 2 sword"
+help.Text = "M1 attack · M2 feint · R critical · F parry/hold block · Q dodge · 1 fists · 2 sword · 3 greatsword"
 help.Parent = gui
 gui.Parent = player:WaitForChild("PlayerGui")
 

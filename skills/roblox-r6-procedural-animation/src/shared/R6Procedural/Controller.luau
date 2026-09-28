@@ -269,6 +269,11 @@ local function onPreSimulation(dt: number)
 		if interval and type(action) == "string" and action ~= "" then
 			interval = 0
 		end
+		-- Limited animation ("on twos"): workspace attribute R6_StepFps holds poses between steps.
+		local stepFps = workspace:GetAttribute("R6_StepFps")
+		if interval and type(stepFps) == "number" and stepFps > 0 then
+			interval = math.max(interval, 1 / stepFps)
+		end
 		if interval == nil then
 			if entry.enabled then
 				rig:restore()

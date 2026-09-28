@@ -44,7 +44,7 @@ function Clips.registerAll()
 		return
 	end
 	registered = true
-	for _, name in { "Fists", "Sword" } do
+	for _, name in Weapons.NAMES do
 		local weapon = Weapons.get(name)
 		if weapon == nil then
 			continue
@@ -120,9 +120,34 @@ local Config = {
 	hitboxPadding = 1.2, -- body radius added to the hitbox (studs)
 	maxInputsPerSecond = 20,
 	baseWalkSpeed = 16,
+
+	-- Visual theme: "Default" (glow VFX) or "Dark" (pixel-art, roblox-dark-pixel-style).
+	-- Override live with workspace attribute CombatVFXTheme.
+	vfxTheme = "Default",
 }
 
 export type Config = typeof(Config)
+
+-- Effect names per outcome for each theme ("Hit" nil = weapon.hitEffect).
+Config.themes = {
+	Default = { Slash = "Slash", Parry = "Parry", Block = "Block", GuardBreak = "GuardBreak", Telegraph = "Telegraph" },
+	Dark = {
+		Slash = "DarkSlash",
+		Parry = "DarkParry",
+		Block = "DarkBlock",
+		GuardBreak = "DarkGuardBreak",
+		Telegraph = "DarkTelegraph",
+		Hit = "DarkHit",
+	},
+} :: { [string]: { [string]: string } }
+
+-- Resolves the effect for an outcome under the active theme.
+function Config.effect(kind: string, fallback: string): string
+	local themeName = workspace:GetAttribute("CombatVFXTheme")
+	local theme = Config.themes[if type(themeName) == "string" then themeName else Config.vfxTheme]
+		or Config.themes.Default
+	return theme[kind] or fallback
+end
 
 return Config
 ]]></string>
@@ -418,6 +443,7 @@ export type Weapon = {
 	parryPose: PoseSpec,
 	hitEffect: string, -- VFX on a clean hit ("ImpactBurst" / "FistImpact")
 	hasBlade: boolean,
+	blade: { size: Vector3, color: Color3, material: Enum.Material }?, -- visual blade (default sword)
 }
 
 local function r(x: number, y: number, z: number, pos: Vector3?): { rot: Vector3, pos: Vector3? }
@@ -689,11 +715,154 @@ Weapons.Sword = (
 	} :: any
 ) :: Weapon
 
+Weapons.Greatsword = (
+	{
+		-- Dragonslayer-style slab of iron: slow, enormous reach, crushing posture damage.
+		name = "Greatsword",
+		speed = 0.74,
+		hitEffect = "ImpactBurst",
+		hasBlade = true,
+		blade = {
+			size = Vector3.new(0.35, 1.25, 7.5),
+			color = Color3.fromRGB(58, 56, 55),
+			material = Enum.Material.CorrodedMetal,
+		},
+		chain = {
+			m({
+				name = "Greatsword_M1_1", -- wide horizontal cleave (two hands)
+				windup = 0.34,
+				active = 0.15,
+				recovery = 0.3,
+				damage = 19,
+				postureDamage = 26,
+				hitboxSize = Vector3.new(15, 7, 11),
+				hitboxForward = 5.5,
+				vfx = "Slash",
+				slashTilt = 10,
+				poses = {
+					windup = {
+						RightShoulder = r(92, 48, 0),
+						LeftShoulder = r(92, 62, 0),
+						RootJoint = r(4, 44, 0, Vector3.new(0, -0.3, 0.3)),
+					},
+					strike = {
+						RightShoulder = r(90, -10, 0),
+						LeftShoulder = r(90, 0, 0),
+						RootJoint = r(-10, -40, 0, Vector3.new(0, -0.45, -0.5)),
+						LeftHip = r(26, 0, 0),
+						RightHip = r(-18, 0, 0),
+					},
+					follow = {
+						RightShoulder = r(80, -22, 0),
+						LeftShoulder = r(80, -12, 0),
+						RootJoint = r(-8, -48, 0, Vector3.new(0, -0.4, -0.4)),
+					},
+				},
+			}),
+			m({
+				name = "Greatsword_M1_2", -- rising diagonal
+				windup = 0.33,
+				active = 0.15,
+				recovery = 0.3,
+				damage = 19,
+				postureDamage = 26,
+				hitboxSize = Vector3.new(12, 9, 11),
+				hitboxForward = 5.5,
+				vfx = "Slash",
+				slashTilt = -50,
+				slashMirror = true,
+				poses = {
+					windup = {
+						RightShoulder = r(20, 0, 30),
+						LeftShoulder = r(30, 0, 40),
+						RootJoint = r(-6, -30, 0, Vector3.new(0, -0.5, 0.2)),
+					},
+					strike = {
+						RightShoulder = r(165, 0, -30),
+						LeftShoulder = r(150, 0, -20),
+						RootJoint = r(12, 30, 0, Vector3.new(0, 0.1, -0.4)),
+						Neck = r(10, 0, 0),
+					},
+				},
+			}),
+			m({
+				name = "Greatsword_M1_3", -- falling cleave, full body
+				windup = 0.4,
+				active = 0.16,
+				recovery = 0.38,
+				damage = 23,
+				postureDamage = 32,
+				hitboxSize = Vector3.new(8, 9, 12),
+				hitboxForward = 6,
+				knockback = 55,
+				finisher = true,
+				vfx = "Slash",
+				slashTilt = 88,
+				poses = {
+					windup = {
+						RightShoulder = r(182, 0, 6),
+						LeftShoulder = r(178, 0, -6),
+						RootJoint = r(18, 0, 0, Vector3.new(0, 0.1, 0.4)),
+						Neck = r(12, 0, 0),
+					},
+					strike = {
+						RightShoulder = r(40, 0, -4),
+						LeftShoulder = r(34, 0, 4),
+						RootJoint = r(-32, 0, 0, Vector3.new(0, -0.8, -0.9)),
+						LeftHip = r(40, 0, 0),
+						RightHip = r(-28, 0, 0),
+						Neck = r(-8, 0, 0),
+					},
+				},
+			}),
+		},
+		critical = m({
+			name = "Greatsword_Critical", -- spinning perilous cleave
+			windup = 0.85,
+			active = 0.2,
+			recovery = 0.55,
+			damage = 34,
+			postureDamage = 0,
+			hitboxSize = Vector3.new(18, 8, 16),
+			hitboxForward = 4,
+			knockback = 60,
+			finisher = true,
+			perilous = true,
+			hyperArmor = true,
+			vfx = "Slash",
+			slashTilt = 5,
+			poses = {
+				windup = {
+					RightShoulder = r(96, 70, 0),
+					LeftShoulder = r(96, 80, 0),
+					RootJoint = r(8, 70, 0, Vector3.new(0, -0.5, 0.3)),
+					Neck = r(0, -40, 0),
+				},
+				strike = {
+					RightShoulder = r(92, -30, 0),
+					LeftShoulder = r(92, -20, 0),
+					RootJoint = r(-14, -80, 0, Vector3.new(0, -0.6, -0.4)),
+					LeftHip = r(20, 0, 0),
+					RightHip = r(-20, 0, 0),
+				},
+			},
+		}),
+		blockPose = {
+			RightShoulder = r(70, 0, -30),
+			LeftShoulder = r(80, 0, -10),
+			RootJoint = r(-8, 22, 0, Vector3.new(0, -0.3, 0)),
+		},
+		parryPose = { RightShoulder = r(120, 0, -40), LeftShoulder = r(110, 0, -20), RootJoint = r(4, 26, 0) },
+	} :: any
+) :: Weapon
+
 -- Scaled timings for a move with its weapon speed.
 function Weapons.timing(weapon: Weapon, move: Move): (number, number, number)
 	local s = weapon.speed
 	return move.windup / s, move.active / s, move.recovery / s
 end
+
+Weapons.NAMES = { "Fists", "Sword", "Greatsword" }
 
 function Weapons.get(name: string): Weapon?
 	local w = (Weapons :: any)[name]
@@ -1097,6 +1266,11 @@ local function onPreSimulation(dt: number)
 		if interval and type(action) == "string" and action ~= "" then
 			interval = 0
 		end
+		-- Limited animation ("on twos"): workspace attribute R6_StepFps holds poses between steps.
+		local stepFps = workspace:GetAttribute("R6_StepFps")
+		if interval and type(stepFps) == "number" and stepFps > 0 then
+			interval = math.max(interval, 1 / stepFps)
+		end
 		if interval == nil then
 			if entry.enabled then
 				rig:restore()
@@ -1296,6 +1470,11 @@ function ActionPose.update(rig, sensor, _dt, _cfg, ctx)
 	local clip = PoseLibrary.get(name)
 	if clip == nil then
 		return
+	end
+	-- Limited animation: snap the clip time to R6_StepFps steps (keys hold, then pop).
+	local stepFps = workspace:GetAttribute("R6_StepFps")
+	if type(stepFps) == "number" and stepFps > 0 then
+		elapsed = math.floor(elapsed * stepFps) / stepFps
 	end
 	local pose, weight = PoseLibrary.sample(clip, elapsed)
 	weight *= ctx.weight("R6_ActionWeight") * math.max(sensor.stateWeight, 0.35)
@@ -3246,6 +3425,7 @@ CameraShaker.settings = {
 	exponent = 2,
 	kickScale = math.rad(4), -- radians of rotation for kick strength 1
 	intensity = 1, -- global user setting (0 disables)
+	stepFps = 0, -- > 0: noise advances in hard steps (choppy, low-framerate art styles)
 	reducedMotionScale = 0.25,
 }
 
@@ -3312,7 +3492,8 @@ local function apply(dt: number)
 
 	local s = scale()
 	local shake = (trauma ^ cfg.exponent) * s
-	local t = elapsed * cfg.frequency
+	local sampleTime = if cfg.stepFps > 0 then math.floor(elapsed * cfg.stepFps) / cfg.stepFps else elapsed
+	local t = sampleTime * cfg.frequency
 
 	local pitch = cfg.maxAngles.X * shake * math.noise(t, 11.3, 0.5) * 2
 	local yaw = cfg.maxAngles.Y * shake * math.noise(t, 27.1, 0.5) * 2
@@ -3472,6 +3653,15 @@ local effects: { [string]: Types.Effect } = {}
 local started = false
 local adaptiveQuality = 1
 
+-- Registers an effect implemented outside VFX/Effects (themes, game-specific effects).
+-- The name must also be listed in Registry.luau to travel over the network.
+function Client.registerEffect(name: string, effect: Types.Effect)
+	effects[name] = effect
+	if started and effect.preload then
+		task.spawn(effect.preload)
+	end
+end
+
 local function loadEffect(name: string): Types.Effect?
 	local cached = effects[name]
 	if cached then
@@ -3587,6 +3777,9 @@ function Client.start()
 	started = true
 
 	for _, name in Registry.names() do
+		if effects[name] == nil and script.Parent.Effects:FindFirstChild(name) == nil then
+			continue -- provided at runtime by Client.registerEffect
+		end
 		local effect = loadEffect(name)
 		if effect and effect.preload then
 			local ok, err = (pcall :: any)(effect.preload)
@@ -5768,6 +5961,13 @@ local NAMES: { string } = {
 	"GuardBreak",
 	"FistImpact",
 	"Telegraph",
+	-- Dark pixel-art theme (roblox-dark-pixel-style), registered at runtime.
+	"DarkSlash",
+	"DarkHit",
+	"DarkParry",
+	"DarkBlock",
+	"DarkGuardBreak",
+	"DarkTelegraph",
 }
 
 local Registry = {}
@@ -6711,7 +6911,7 @@ local function face(root: BasePart, target: Vector3)
 end
 
 local function moveInfo(clip: string): (Weapons.Weapon?, Weapons.Move?)
-	for _, name in { "Fists", "Sword" } do
+	for _, name in Weapons.NAMES do
 		local weapon = Weapons.get(name)
 		if weapon then
 			for _, move in weapon.chain do
@@ -6959,16 +7159,25 @@ local function resolveHit(a: Entity, d: Entity, move: Weapons.Move, isCritical: 
 	elseif outcome == "Parried" then
 		d.fighter.lastParryWhiff = -math.huge -- a successful parry is never punished
 		stun(a, cfg.parriedStun, "Parried")
-		VFXService.play("Parry", { cframe = hitFrame, source = d.model, target = a.model, power = 1.5 })
+		VFXService.play(
+			Config.effect("Parry", "Parry"),
+			{ cframe = hitFrame, source = d.model, target = a.model, power = 1.5 }
+		)
 	elseif outcome == "Blocked" then
 		d.fighter.lastPostureHit = t
 		knockback(d, direction * 10)
-		VFXService.play("Block", { cframe = hitFrame, source = a.model, target = d.model, power = 1 })
+		VFXService.play(
+			Config.effect("Block", "Block"),
+			{ cframe = hitFrame, source = a.model, target = d.model, power = 1 }
+		)
 	elseif outcome == "GuardBreak" then
 		d.fighter.lastPostureHit = t
 		stun(d, cfg.guardBreakStun, "GuardBroken", "GuardBroken")
 		knockback(d, direction * 18)
-		VFXService.play("GuardBreak", { cframe = hitFrame, source = a.model, target = d.model, power = 2 })
+		VFXService.play(
+			Config.effect("GuardBreak", "GuardBreak"),
+			{ cframe = hitFrame, source = a.model, target = d.model, power = 2 }
+		)
 	else -- Hit
 		d.humanoid:TakeDamage(move.damage)
 		local armored = d.fighter.hyperArmor and d.fighter.phase == "windup"
@@ -6979,7 +7188,7 @@ local function resolveHit(a: Entity, d: Entity, move: Weapons.Move, isCritical: 
 			knockback(d, direction * move.knockback + Vector3.new(0, move.knockback * 0.35, 0))
 		end
 		local heavy = move.finisher == true or isCritical
-		VFXService.play(a.weapon.hitEffect, {
+		VFXService.play(Config.effect("Hit", a.weapon.hitEffect), {
 			cframe = hitFrame,
 			source = a.model,
 			target = d.model,
@@ -6993,7 +7202,7 @@ end
 local function strike(e: Entity, move: Weapons.Move, rewindTime: number, isCritical: boolean)
 	local box = Hitbox.boxFor(e.root.CFrame, move.hitboxForward)
 	if move.vfx == "Slash" then
-		VFXService.play("Slash", {
+		VFXService.play(Config.effect("Slash", "Slash"), {
 			cframe = slashFrame(e.root.CFrame, move),
 			power = if isCritical then 2.2 else 1.2,
 			variant = if move.slashMirror then 1 else 0,
@@ -7038,7 +7247,10 @@ local function startAttack(e: Entity, critical: boolean, clientTime: number?)
 	f.hyperArmor = move.hyperArmor == true
 	setAction(e, move.name)
 	if move.perilous then
-		VFXService.play("Telegraph", { cframe = e.root.CFrame, source = e.model, power = 1 })
+		VFXService.play(
+			Config.effect("Telegraph", "Telegraph"),
+			{ cframe = e.root.CFrame, source = e.model, power = 1 }
+		)
 	end
 
 	-- Lag compensation: rewind defenders to what the attacker saw at strike time, capped.
@@ -7138,11 +7350,13 @@ local function equipBlade(e: Entity)
 	if arm == nil or not arm:IsA("BasePart") then
 		return
 	end
+	local spec = e.weapon.blade
+	local size = if spec then spec.size else Vector3.new(0.14, 0.45, 4.4)
 	local blade = Instance.new("Part")
 	blade.Name = "CombatBlade"
-	blade.Size = Vector3.new(0.14, 0.45, 4.4)
-	blade.Material = Enum.Material.Metal
-	blade.Color = Color3.fromRGB(200, 205, 215)
+	blade.Size = size
+	blade.Material = if spec then spec.material else Enum.Material.Metal
+	blade.Color = if spec then spec.color else Color3.fromRGB(200, 205, 215)
 	blade.CanCollide = false
 	blade.CanQuery = false
 	blade.CanTouch = false
@@ -7150,16 +7364,16 @@ local function equipBlade(e: Entity)
 	local weld = Instance.new("Weld")
 	weld.Part0 = arm
 	weld.Part1 = blade
-	weld.C0 = CFrame.new(0, -1.05, -2.35) -- held in the fist, blade forward
+	weld.C0 = CFrame.new(0, -1.05, -size.Z / 2 + 0.2) -- held in the fist, blade forward
 	weld.Parent = blade
 	-- Trail between base and tip; clients enable it during active frames.
 	local base = Instance.new("Attachment")
 	base.Name = "TrailBase"
-	base.Position = Vector3.new(0, 0, 1.6)
+	base.Position = Vector3.new(0, 0, size.Z * 0.36)
 	base.Parent = blade
 	local tip = Instance.new("Attachment")
 	tip.Name = "TrailTip"
-	tip.Position = Vector3.new(0, 0, -2.2)
+	tip.Position = Vector3.new(0, 0, -size.Z * 0.5)
 	tip.Parent = blade
 	local trail = Instance.new("Trail")
 	trail.Name = "SwingTrail"
@@ -7832,7 +8046,7 @@ end
 ------------------------------------------------------------------------------------
 
 local moveByName: { [string]: { weapon: Weapons.Weapon, move: Weapons.Move } } = {}
-for _, name in { "Fists", "Sword" } do
+for _, name in Weapons.NAMES do
 	local weapon = Weapons.get(name)
 	if weapon then
 		for _, move in weapon.chain do
@@ -7957,7 +8171,7 @@ local function attack(critical: boolean)
 			end
 			local _, r = character()
 			if r then
-				VFXClient.play("Slash", {
+				VFXClient.play(Config.effect("Slash", "Slash"), {
 					cframe = r.CFrame * CFrame.new(0, 0.6, -2.4) * CFrame.Angles(0, 0, math.rad(move.slashTilt or 0)),
 					power = if critical then 2.2 else 1.2,
 					variant = if move.slashMirror then 1 else 0,
@@ -8090,6 +8304,11 @@ bind("CombatSword", function(state)
 		input:FireServer("Equip", "Sword")
 	end
 end, Enum.KeyCode.Two)
+bind("CombatGreatsword", function(state)
+	if state == Enum.UserInputState.Begin then
+		input:FireServer("Equip", "Greatsword")
+	end
+end, Enum.KeyCode.Three)
 
 ------------------------------------------------------------------------------------
 -- HUD: posture bar (fills with blocked damage; full = guard break)
@@ -8119,7 +8338,7 @@ help.TextColor3 = Color3.new(1, 1, 1)
 help.TextStrokeTransparency = 0.5
 help.Font = Enum.Font.GothamMedium
 help.TextSize = 14
-help.Text = "M1 attack · M2 feint · R critical · F parry/hold block · Q dodge · 1 fists · 2 sword"
+help.Text = "M1 attack · M2 feint · R critical · F parry/hold block · Q dodge · 1 fists · 2 sword · 3 greatsword"
 help.Parent = gui
 gui.Parent = player:WaitForChild("PlayerGui")
 
