@@ -1,31 +1,73 @@
-# Hitstop, Camera Shake & Post-Processing Impact Guide
+# Hitstop, Camera Shake & Post-Processing Impact
 
-In *Deepwoken* and high-impact action RPGs, the "weight" of a hit comes 50% from visual effects and 50% from camera feedback and frame pausing (*hitstop*).
+The "weight" of a hit is half visuals, half feedback: a few frozen frames, a camera reaction
+and a very short post-processing punch.
 
-## 1. What is Hitstop?
-Hitstop is a fighting-game technique where both the attacker and defender animations temporarily freeze for a fraction of a second (typically 0.04 to 0.12 seconds) upon landing a hit.
-- Light hit (M1 sword swing): `0.04s - 0.06s`
-- Heavy hit (Crits, parry counter): `0.08s - 0.14s`
+## 1. Hitstop (`Hitstop.luau`)
 
-### Implementation Pattern:
 ```lua
-local function applyHitstop(attackerTrack: AnimationTrack?, victimTrack: AnimationTrack?, duration: number)
-    if attackerTrack then attackerTrack:AdjustSpeed(0) end
-    if victimTrack then victimTrack:AdjustSpeed(0) end
-    
-    task.delay(duration, function()
-        if attackerTrack and attackerTrack.IsPlaying then attackerTrack:AdjustSpeed(1) end
-        if victimTrack and victimTrack.IsPlaying then victimTrack:AdjustSpeed(1) end
-    end)
-end
+Hitstop.apply({ attackerCharacter, victimCharacter }, 0.07)                   -- freeze
+Hitstop.apply({ attacker, victim }, 0.12, { speed = 0.05, freezeVFX = true }) -- heavy slow-mo + frozen slashes
 ```
 
-## 2. Directional Camera Shake
-Instead of random noise, directional shakes give dramatic impact:
-- Push the camera slightly in the direction of the blade cut or knockback.
-- Return to normal position within 0.15s using a damped spring or smooth sine lerp.
+| Hit | Duration |
+|---|---|
+| Light M1 | 0.04–0.06 s |
+| Heavy / critical | 0.08–0.12 s |
+| Parry / perfect block | 0.12–0.16 s |
+| Blocked | ~0.035 s |
 
-## 3. Post-Processing Micro-Flash
-Triggered locally on the victim's client or observers when a critical strike or parry occurs:
-- **Bloom**: Temporarily raise `BloomEffect.Intensity` from `1` to `4` for `0.05s`, then tween back to `1`.
-- **ColorCorrection**: Briefly bump `Contrast` to `0.2` and drop `Brightness` slightly to create a sudden high-contrast punch frame.
+Implementation details that matter:
+
+- Freezes **every** playing track (`Animator:GetPlayingAnimationTracks()`): idle, walk and attack
+  layers would otherwise keep moving.
+- Stores each track's **original** `Speed` and restores it (a 1.3× attack stays 1.3×).
+- Overlapping hitstops **extend** the release time instead of un-freezing early.
+- Restores in `RunService.PreAnimation` — the documented place to change track speed before the
+  Animator steps.
+- `freezeVFX` sets `Animator` group `"world"` time scale to the hitstop speed: slashes freeze
+  mid-swing and resume. UI flashes use group `"ui"`, debris physics are never frozen.
+- Apply it on every client within ~90 studs so observers see the same freeze (`ImpactBurst` does).
+
+## 2. Camera shake (`CameraShaker.luau`)
+
+Trauma model (Squirrel Eiserloh, GDC 2016 "Juicing Your Cameras With Math"):
+
+- `addTrauma(x)` adds to `trauma ∈ [0, 1]`, which decays linearly (`traumaDecay` per second).
+- Shake amount = `trauma²`: small hits barely move the camera, stacked hits escalate.
+- Offsets come from `math.noise` (smooth Perlin), never `math.random` jitter.
+- `kick(worldDirection, strength)`: directional punch on an under-damped spring (the view jerks
+  along the blow, then settles). `fovPunch(-4)`: zoom-in punch that springs back.
+- `addTraumaAt(amount, origin, radius)`: squared distance falloff for explosions/slams.
+
+No drift, no fighting the camera script: the offset is removed at `RenderPriority.Camera - 1`
+(only if nothing else moved the camera) and re-applied at `Camera + 1`.
+
+Typical values: jab 0.08–0.12, heavy hit 0.25–0.35, ground slam 0.4–0.6 (with falloff), ultimate 0.8.
+
+## 3. Post-processing punch (`ScreenFlash.luau`)
+
+```lua
+ScreenFlash.impact({ duration = 0.18, contrast = 0.2, bloom = 1.2, blur = 6 })
+ScreenFlash.impactFrame(0.05) -- manga-style monochrome frames on critical hits
+```
+
+- Uses its own neutral `ColorCorrectionEffect` / `BlurEffect` in Lighting: never overwrites the
+  game's grading.
+- Bloom is modulated **relative to a base captured once** (legacy code captured `Intensity`
+  mid-flash on rapid hits and drifted brighter forever).
+- Overlapping impulses sum with individual envelopes, then clamp.
+
+## 4. Accessibility
+
+`GuiService.ReducedMotionEnabled` is honored: camera shake scaled to 25%, flashes halved, impact
+frames skipped. Also expose `CameraShaker.settings.intensity` in your settings menu.
+
+## 5. Who gets what
+
+| Feedback | Attacker | Victim | Bystanders |
+|---|---|---|---|
+| Sparks / flash / highlight | ✓ | ✓ | ✓ (culled by distance) |
+| Hitstop (animation freeze) | ✓ | ✓ | ✓ within ~90 studs |
+| Camera trauma | small + FOV punch | strong + directional kick | only for slams/explosions (falloff) |
+| Impact frame | critical only | critical only | ✗ |
