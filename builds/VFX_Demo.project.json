@@ -1,0 +1,74 @@
+{
+  "name": "VFX_Demo",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "VFX": {
+        "$path": "../.claude/skills/roblox-mesh-vfx/src/shared/VFX"
+      },
+      "VFXDemo": {
+        "$path": "../.claude/skills/roblox-mesh-vfx/src/demo/shared"
+      }
+    },
+    "ServerScriptService": {
+      "VFXServer": {
+        "$path": "../.claude/skills/roblox-mesh-vfx/src/server"
+      },
+      "VFXDemoServer": {
+        "$path": "../.claude/skills/roblox-mesh-vfx/src/demo/server/DemoServer.server.luau"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "VFXClient": {
+          "$path": "../.claude/skills/roblox-mesh-vfx/src/client"
+        },
+        "VFXDemoClient": {
+          "$path": "../.claude/skills/roblox-mesh-vfx/src/demo/client/DemoClient.client.luau"
+        }
+      }
+    },
+    "Workspace": {
+      "$className": "Workspace",
+      "Baseplate": {
+        "$className": "Part",
+        "$properties": {
+          "Anchored": true,
+          "Size": [
+            512,
+            20,
+            512
+          ],
+          "Position": [
+            0,
+            -10,
+            0
+          ],
+          "Color": [
+            0.39,
+            0.37,
+            0.35
+          ],
+          "Material": "Concrete",
+          "Locked": true
+        }
+      },
+      "SpawnLocation": {
+        "$className": "SpawnLocation",
+        "$properties": {
+          "Anchored": true,
+          "Size": [
+            12,
+            1,
+            12
+          ],
+          "Position": [
+            0,
+            0.5,
+            0
+          ]
+        }
+      }
+    }
+  }
+}
